@@ -30,7 +30,7 @@
 #include <Fonts/FreeSansBold18pt7b.h>
 
 // ----------------------- user settings ----------------------
-#define TIME_SCALE        60       // 1 = real time; 60 = 1 pet-day per 24 real minutes
+#define TIME_SCALE        30       // 1 = real time; 30 = 1 pet-day per 48 real minutes
 #define BACKLIGHT_BRIGHT  255
 #define BACKLIGHT_DIM     30
 #define ROTATION          2        // flip to 0 if image is upside-down
@@ -90,6 +90,20 @@ const uint16_t COL_GOOD    = RGB565(80, 220, 130);
 const uint16_t COL_BAD     = RGB565(255, 82, 82);
 
 // ----------------------- utility ----------------------------
+// Non-blocking, USB-independent logger: if the host is absent/busy
+// (flaky cable, no monitor open) we DROP the message instead of
+// stalling the render loop. The pet must never wait on a PC.
+static inline void dbg(const char *fmt, ...)
+{
+  if (Serial.availableForWrite() < 24) return;
+  char buf[96];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  Serial.print(buf);
+}
+
 static inline uint16_t hsv565(float h, float s, float v)
 {
   h = fmodf(h, 360.0f); if (h < 0) h += 360;
@@ -134,14 +148,15 @@ bool tpTouch = false;        // true while finger is down (updated by pollTouch)
 uint16_t tpX = 120, tpY = 120;
 bool tpAlive = false;
 
-void readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
+bool readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
 {
   Wire.beginTransmission(TP_ADDR);
   Wire.write(reg);
-  if (Wire.endTransmission(false) != 0) return;
-  if (Wire.requestFrom(TP_ADDR, len) != len) return;
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(TP_ADDR, len) != len) return false;
   for (uint8_t i = 0; i < len; i++) buf[i] = Wire.read();
   tpAlive = true;
+  return true;
 }
 
 void touchInit()
@@ -149,8 +164,26 @@ void touchInit()
   pinMode(T_RST, OUTPUT);
   digitalWrite(T_RST, LOW); delay(20);
   digitalWrite(T_RST, HIGH); delay(60);
-  Wire.begin(T_SDA, T_SCL, 400000U);
+  Wire.begin(T_SDA, T_SCL, 100000U);   // 100kHz: far more robust than 400k here
   Wire.setTimeOut(50);
+}
+
+// un-stick a hung I2C bus and reset the touch controller
+void touchReinit()
+{
+  pinMode(T_SCL, OUTPUT);
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(T_SCL, LOW); delayMicroseconds(5);
+    digitalWrite(T_SCL, HIGH); delayMicroseconds(5);
+  }
+  Wire.end();
+  pinMode(T_RST, OUTPUT);
+  digitalWrite(T_RST, LOW); delay(20);
+  digitalWrite(T_RST, HIGH); delay(60);
+  Wire.begin(T_SDA, T_SCL, 100000U);
+  Wire.setTimeOut(50);
+  tpAlive = false;
+  dbg("[TP] controller re-initialized\n");
 }
 
 uint16_t lastSampleX = 120, lastSampleY = 120;
@@ -161,9 +194,27 @@ uint32_t lastHeartAt = 0;
 uint8_t pollTouch()
 {
   static bool wasDown = false;
-  uint8_t r[6];
-  readRegs(0x01, r, 6);
-  bool down = (r[1] >= 1 && r[1] < 3);
+  static bool broken = false;
+  static uint32_t lastReinit = 0;
+
+  if (broken) {                    // recovering from a bus hang
+    if (millis() - lastReinit > 1500) { touchReinit(); broken = false; }
+    return 0;
+  }
+
+  uint8_t r[6] = {0};
+  uint32_t t0 = micros();
+  bool ok = readRegs(0x01, r, 6);
+  uint32_t elapsed = micros() - t0;
+  if (elapsed > 30000) {           // transaction took way too long: bus stuck
+    broken = true;
+    lastReinit = millis();
+    strokeAccum = 0;
+    tpTouch = false;
+    dbg("[TP] bus hang (%lums) -> reinit\n", (unsigned long)(elapsed / 1000));
+    return 0;
+  }
+  bool down = ok && (r[1] >= 1 && r[1] < 3);
 
   if (down) {
     uint16_t x = ((r[2] & 0x0F) << 8) | r[3];
@@ -192,7 +243,7 @@ uint8_t pollTouch()
     return 2;
   }
   tpTouch = false;
-  if (wasDown) { wasDown = false; return 3; }
+  if (wasDown) { wasDown = false; strokeAccum = 0; return 3; }
   return 0;
 }
 
@@ -234,7 +285,10 @@ uint32_t celebrateUntil = 0;
 uint32_t stateEnd = 0;         // generic end timestamp for EATING
 bool infoOverlay = false;
 bool virginBoot = false;
+bool orientPending = true;   // orientation self-test shown until first tap
 uint32_t bootAt = 0;
+uint32_t wakeGraceAt = 0;    // pet won't re-sleep this long after waking
+uint32_t infoOpenAt = 0;     // stats overlay opened at (for auto-dismiss)
 
 // mini-game
 struct Game {
@@ -335,19 +389,21 @@ void simTick()   // every 250ms
     }
   }
 
-  // exhaustion -> sleep
-  if (tama.state == ST_AWAKE && tama.energy <= 4) {
+  // exhaustion -> sleep (with wake-grace so manual wake-ups stick)
+  if (tama.state == ST_AWAKE && tama.energy <= 8 &&
+      (int32_t)(millis() - wakeGraceAt) > 10000) {
     tama.state = ST_SLEEPING;
     statsDirty = true;
-    Serial.println("[TAMA] fell asleep");
+    dbg("[TAMA] fell asleep\n");
   }
   if (tama.state == ST_SLEEPING) {
     analogWrite(PIN_BL, BACKLIGHT_DIM);
-    if (tama.energy >= 97) {
+    if (tama.energy >= 40) {               // natural wake: recharge to 40
       tama.state = ST_AWAKE;
+      wakeGraceAt = millis();
       happyUntil = millis() + 1200;
       analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
-      Serial.println("[TAMA] woke up rested");
+      dbg("[TAMA] woke up rested\n");
     }
   }
 
@@ -359,16 +415,16 @@ void simTick()   // every 250ms
     celebrateUntil = millis() + 2200;
     for (int i = 0; i < 10; i++)
       spawnPart(3, 120 + random(-60, 61), 90 + random(-50, 51), 0, -2, 30);
-    Serial.printf("[TAMA] evolved to %s!\n", STAGE_NAME[st]);
+    dbg("[TAMA] evolved to %s!\n", STAGE_NAME[st]);
   }
 
-  if (statsDirty && millis() - lastSaveAt > 20000) saveTamagotchi();
+  if (statsDirty && millis() - lastSaveAt > 60000) saveTamagotchi();
 
   // periodic status log for remote verification
   static uint32_t lastStatLog = 0;
   if (millis() - lastStatLog > 60000) {
     lastStatLog = millis();
-    Serial.printf("[TAMA] age=%us h=%u f=%u e=%u stage=%s poops=%u\n",
+    dbg("[TAMA] age=%us h=%u f=%u e=%u stage=%s poops=%u\n",
                   (unsigned)tama.ageSec, (uint8_t)tama.hunger, (uint8_t)tama.fun,
                   (uint8_t)tama.energy, STAGE_NAME[tama.stage],
                   poops[0].active + poops[1].active + poops[2].active + poops[3].active);
@@ -447,7 +503,7 @@ void endGame()
   happyUntil = millis() + 1400;
   statsDirty = true;
   spawnPart(3, 120, 60, 0, -1, 26);
-  Serial.printf("[TAMA] game over hits=%u\n", game.hits);
+  dbg("[TAMA] game over hits=%u\n", game.hits);
 }
 
 void handleTap(uint16_t x, uint16_t y)
@@ -463,6 +519,7 @@ void handleTap(uint16_t x, uint16_t y)
   }
   if (tama.state == ST_SLEEPING) {          // wake up
     tama.state = ST_AWAKE;
+    wakeGraceAt = millis();
     analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
     happyUntil = millis() + 600;
     statsDirty = true;
@@ -475,8 +532,14 @@ void handleTap(uint16_t x, uint16_t y)
       if (i == 0) startFeeding();
       else if (i == 1) startGame();
       else {
-        if (!poops[0].active && !poops[1].active && !poops[2].active && !poops[3].active) headShake();
-        else { clearPoops(); celebrateUntil = millis() + 800; }
+        bool any = poops[0].active || poops[1].active || poops[2].active || poops[3].active;
+        if (!any) {   // all clean: happy sparkle instead of a confusing head-shake
+          happyUntil = millis() + 800;
+          for (int k = 0; k < 4; k++) spawnPart(3, ICON[2][0] + random(-14, 15), ICON[2][1] - 10, 0, -2, 18);
+        } else {
+          clearPoops();
+          celebrateUntil = millis() + 800;
+        }
       }
       return;
     }
@@ -491,8 +554,8 @@ void handleTap(uint16_t x, uint16_t y)
   // plain poke on the creature
   int dx = x - 120, dy = y - 104;
   if (dx * dx + dy * dy < 95 * 95) {
-    happyUntil = millis() + 900;
-    tama.fun += 1;
+    happyUntil = millis() + 1000;
+    tama.fun += 2;
     if (tama.fun > 100) tama.fun = 100;
     statsDirty = true;
   }
@@ -513,12 +576,12 @@ void handleTouchFrame()
     if (strokeAccum > 26) moved = true;
     // petting: drag across the creature
     if (tama.state == ST_AWAKE && moved && !infoOverlay &&
-        millis() - lastHeartAt > 260) {
+        millis() - lastHeartAt > 180) {
       int dx = tpX - 120, dy = tpY - 104;
       if (dx * dx + dy * dy < 95 * 95) {
         lastHeartAt = millis();
-        happyUntil = millis() + 900;
-        tama.fun += 0.9f;
+        happyUntil = millis() + 1200;
+        tama.fun += 1.6f;
         if (tama.fun > 100) tama.fun = 100;
         statsDirty = true;
         spawnPart(0, tpX, tpY - 12, 0, -2, 22);
@@ -528,9 +591,11 @@ void handleTouchFrame()
     if (!longFired && millis() - downAt > 700 &&
         strokeAccum < 14 && tama.state == ST_AWAKE) {
       longFired = true;
+      infoOpenAt = millis();
       infoOverlay = !infoOverlay;
     }
   } else if (ev == 3) {                     // released
+    if (orientPending) { orientPending = false; return; }   // dismiss self-test
     if (!longFired && !moved && millis() - downAt < 500) {
       handleTap(tpX, tpY);
     }
@@ -542,18 +607,29 @@ void setup()
 {
   Serial.begin(115200);
   delay(120);
-  Serial.println("\n[ORB-TAMA] booting");
+  dbg("\n[ORB-TAMA] booting\n");
 
   pinMode(PIN_BL, OUTPUT);
   analogWrite(PIN_BL, 0);
 
-  if (!gfx->begin(80000000)) Serial.println("[ORB] gfx begin FAILED");
+  if (!gfx->begin(80000000)) dbg("[ORB] gfx begin FAILED\n");
   cv->begin(GFX_SKIP_OUTPUT_BEGIN);
   gfx->fillScreen(0x0000);
   analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
 
   touchInit();
   loadTamagotchi();
+
+  // welcome-back care package: a neglected pet is always approachable
+  bool rescued = false;
+  if (tama.hunger < 35) { tama.hunger = 45; rescued = true; }
+  if (tama.fun < 35)    { tama.fun = 45;    rescued = true; }
+  if (tama.energy < 35) { tama.energy = 45; rescued = true; }
+  if (rescued) {
+    statsDirty = true;
+    dbg("[TAMA] welcome-back boost h=%u f=%u e=%u\n",
+                  (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy);
+  }
 
   bootAt = millis();
   fpsT0 = millis();
@@ -568,8 +644,13 @@ void loop()
 
   if (nowMs - lastTick >= 250) {
     lastTick = nowMs;
+    uint32_t tSim = micros();
     simTick();
+    uint32_t dSim = micros() - tSim;
+    if (dSim > 50000) dbg("[PERF] simTick %lums\n", (unsigned long)(dSim / 1000));
   }
+
+  if (infoOverlay && nowMs - infoOpenAt > 5000) infoOverlay = false;  // never gets stuck
 
   if (tama.state == ST_EATING && (int32_t)(stateEnd - nowMs) < 0) {
     tama.state = ST_AWAKE;
@@ -578,22 +659,34 @@ void loop()
     pendingMealPoop++;
     happyUntil = nowMs + 1000;
     statsDirty = true;
+    dbg("[TAMA] fed h=%u\n", (uint8_t)tama.hunger);
   }
   if (tama.state == ST_PLAYING && game.active) tickGame();
 
   updateLook(nowMs);
+  uint32_t tRen = micros();
   renderScene(nowMs);
+  uint32_t dRen = micros() - tRen;
+  if (dRen > 50000) dbg("[PERF] render %lums\n", (unsigned long)(dRen / 1000));
+  uint32_t tFl = micros();
   cv->flush();
+  uint32_t dFl = micros() - tFl;
+  if (dFl > 50000) dbg("[PERF] flush %lums\n", (unsigned long)(dFl / 1000));
 
   fpsFrames++;
   if (nowMs - fpsT0 >= 1000) {
     fpsShown = fpsFrames * 1000.0f / (nowMs - fpsT0);
     fpsFrames = 0; fpsT0 = nowMs;
-    Serial.printf("[TAMA] %s %.1ffps h=%u\n", STAGE_NAME[tama.stage], fpsShown, ESP.getFreeHeap());
+    dbg("[TAMA] %s %.1ffps h=%u\n", STAGE_NAME[tama.stage], fpsShown, ESP.getFreeHeap());
   }
 
   int32_t budget = 22000 - (int32_t)(micros() - frameStart);
   if (budget > 0) delayMicroseconds(budget);
+
+  // diagnostic: flag abnormally slow frames (stuck I2C / NVS writes)
+  uint32_t frameCost = micros() - frameStart;
+  if (frameCost > 200000)
+    dbg("[TP] slow frame %lums\n", (unsigned long)(frameCost / 1000));
 }
 
 // ------------------------- mini-game ------------------------
@@ -700,6 +793,12 @@ void renderScene(uint32_t tms)
   uint16_t *fb = cv->getFramebuffer();
   for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = COL_BG;
 
+  if (orientPending) {
+    if (tms - bootAt > 10000) orientPending = false;   // auto-dismiss fallback
+    else drawOrientationTest();
+    return;
+  }
+
   drawGaugeRing();
 
   // body disc + rim light
@@ -716,6 +815,28 @@ void renderScene(uint32_t tms)
   if (infoOverlay) drawInfo();
   if (virginBoot) drawEggIntro(tms);
   if (game.active) drawGameOverlay(tms);
+}
+
+// ---------------------- orientation test --------------------
+void drawOrientationTest()
+{
+  uint16_t *fb = cv->getFramebuffer();
+  for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = RGB565(10, 10, 14);
+
+  cv->setFont(&FreeSansBold12pt7b);
+  drawCenteredString("TOP", 120, 22, RGB565(255, 255, 255));
+  drawCenteredString("BOTTOM", 120, 218, RGB565(255, 255, 255));
+  cv->setFont(&FreeSansBold18pt7b);
+  drawCenteredString("L", 24, 120, RGB565(120, 200, 255));
+  drawCenteredString("R", 216, 120, RGB565(120, 200, 255));
+
+  // big arrow pointing "up"
+  int cx = 120, cy = 116;
+  cv->fillTriangle(cx, cy - 22, cx - 14, cy + 2, cx + 14, cy + 2, RGB565(255, 200, 60));
+  cv->fillRect(cx - 3, cy + 2, 6, 18, RGB565(255, 200, 60));
+
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString("tap to continue", 120, 176, RGB565(140, 150, 170));
 }
 
 // ---- stat ring: three colored arc segments around the bezel ----
@@ -788,7 +909,7 @@ void drawPet(uint32_t tms)
   bool celebrating = (int32_t)(celebrateUntil - tms) > 0;
   bool sleeping = tama.state == ST_SLEEPING;
   bool sad = !sleeping && !happy &&
-             (tama.hunger < 30 || tama.fun < 30 || tama.energy < 20);
+             (tama.hunger < 25 || tama.fun < 20 || tama.energy < 15);
 
   float squash = 1.0f;
   if (sleeping) squash = 0.12f;
@@ -855,21 +976,25 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad)
 {
   if (sleeping) return;
   if (tama.state == ST_EATING) {
+    // open mouth: dark hole with a pink tongue peeking out + crumbs
     float open = fabsf(sinf(tms * 0.022f));
-    int mh = 3 + (int)(9 * open);
-    cv->fillEllipse(120, 162, 11, mh, RGB565(30, 20, 24));
+    int mw = 8 + (int)(9 * open);
+    cv->fillEllipse(120, 162, mw, 5, RGB565(26, 14, 20));
+    if (mw > 10) cv->fillEllipse(120, 163, mw - 4, 2, RGB565(255, 118, 140));
+    if (open > 0.82 && random(100) < 25)
+      spawnPart(2, 120 + random(-mw, mw + 1), 168, random(-2, 3), -2, 14);
     return;
   }
-  if (sad) {   // frown
-    for (float a = -40; a <= 40; a += 3) {
+  if (sad) {   // frown: corners UP, middle DOWN
+    for (float a = 35; a <= 145; a += 3) {
       float rad = a * DEG_TO_RAD;
       int x = 120 + (int)(cosf(rad) * 30);
-      int y = 184 + (int)(sinf(rad) * 30);
+      int y = 184 - (int)(sinf(rad) * 30);
       cv->fillCircle(x, y, 3, RGB565(120, 126, 142));
     }
     return;
   }
-  if (happy) { // smile
+  if (happy) { // smile: corners DOWN, middle UP
     for (float a = 35; a <= 145; a += 2) {
       float rad = a * DEG_TO_RAD;
       int x = 120 + (int)(cosf(rad) * 42);
@@ -1072,7 +1197,7 @@ void drawEggIntro(uint32_t tms)
     happyUntil = millis() + 1500;
     for (int i = 0; i < 12; i++)
       spawnPart(3, 120 + random(-70, 71), 110 + random(-60, 61), 0, -2, 30);
-    Serial.println("[TAMA] hatched!");
+    dbg("[TAMA] hatched!\n");
   }
 }
 
