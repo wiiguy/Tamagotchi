@@ -3,28 +3,23 @@
 //  ESP32-2424S012 (ESP32-C3, 1.28" round GC9A01 240x240 IPS,
 //  CST816D touch). NO BUTTONS REQUIRED - everything is touch.
 //
-//  How to care for your Orb:
-//    - DRAG your finger over it .... petting (hearts, +fun)
-//    - TAP it ...................... it giggles (+tiny fun)
-//    - BURGER icon (bottom left) ... feed (+fullness)
-//    - BALL icon (bottom middle) ... play bubble-pop game
-//                                    (+fun, -energy)
-//    - DROP icon (bottom right) .... clean up everything
-//    - TAP a poop .................. clean just that one
-//    - HOLD finger ~1s ............. stats & age overlay
+//  Care: drag=pet, tap=giggle, burger=feed, ball=games (pop /
+//  catch / memory chooser), drop=clean, tap poop=clean one,
+//  hold ~1s=stats overlay, swipe left=feed, swipe right=clean.
 //
-//  It gets hungry/bored/tired on its own, poops after meals,
-//  falls asleep (and dims the screen) when exhausted, hatches
-//  from an egg on first boot and evolves as it ages. State is
-//  saved to flash every ~20s, so it survives power-off and
-//  even re-flashing.
-//
-//  Set TIME_SCALE below to speed up its life (60 = 1 day per
-//  24 minutes - great for watching it evolve).
+//  Life: hatches with a PERSONALITY (lazy/hyper/picky/cuddly),
+//  evolves BABY->TEEN->ADULT with care-based FORM (chubby /
+//  athletic / sparkly), sleeps at night if WiFi/NTP is on (with
+//  an ambient clock face), naps when exhausted, gets zoomies,
+//  gets curious, and complains in speech bubbles when neglected.
+//  Battery % arc appears once BATTERY_PIN is enabled (probe
+//  logs at boot).
 // ============================================================
 
 #include <Arduino_GFX_Library.h>
 #include <Preferences.h>
+#include <WiFi.h>
+#include <time.h>
 #include <Fonts/FreeSansBold9pt7b.h>
 #include <Fonts/FreeSansBold12pt7b.h>
 #include <Fonts/FreeSansBold18pt7b.h>
@@ -34,6 +29,20 @@
 #define BACKLIGHT_BRIGHT  255
 #define BACKLIGHT_DIM     30
 #define ROTATION          2        // flip to 0 if image is upside-down
+
+// optional WiFi + NTP (empty SSID = stay offline; night sleep then
+// falls back to energy-based naps only)
+const char *WIFI_SSID = "";
+const char *WIFI_PASS = "";
+const char *TZ_RULE   = "CET-1CEST,M3.5.0,M10.5.0/3"; // Amsterdam
+#define NIGHT_START_HOUR 22
+#define NIGHT_END_HOUR   7
+
+// battery sense: leave -1 until the boot-time probe (analogRead on
+// GPIO0/1) identifies the right pin, then set it + calibrate raws.
+#define BATTERY_PIN      -1
+#define BAT_EMPTY_RAW    1500     // ~3.0V on the divider pin
+#define BAT_FULL_RAW     2150     // ~4.2V on the divider pin
 
 // ---- board pins (JCZN ESP32-2424S012) ----
 #define PIN_SCLK 6
@@ -56,9 +65,7 @@
 Arduino_DataBus *bus = new Arduino_ESP32SPI(PIN_DC, PIN_CS, PIN_SCLK, PIN_MOSI);
 Arduino_GFX *gfx     = new Arduino_GC9A01(bus, PIN_RST, ROTATION, true /* IPS */);
 
-// The heap's largest free block (~114.7KB) is too small for a malloc'ed
-// 240x240x2 canvas, so we back it with a linker-placed static buffer.
-static uint16_t g_framebuffer[240 * 240];
+static uint16_t g_framebuffer[240 * 240];   // heap can't fit a malloc'ed canvas
 
 class StaticCanvas : public Arduino_Canvas
 {
@@ -118,7 +125,7 @@ static inline uint16_t hsv565(float h, float s, float v)
   return RGB565((int)((r + m) * 255), (int)((g + m) * 255), (int)((b + m) * 255));
 }
 
-static inline uint16_t lerpColor(uint16_t a, uint16_t b, uint8_t t) // t 0..255
+static inline uint16_t lerpColor(uint16_t a, uint16_t b, uint8_t t)
 {
   int ar = (a >> 11) << 3, ag = ((a >> 5) & 0x3F) << 2, ab = (a & 0x1F) << 3;
   int br = (b >> 11) << 3, bg = ((b >> 5) & 0x3F) << 2, bb = (b & 0x1F) << 3;
@@ -128,7 +135,6 @@ static inline uint16_t lerpColor(uint16_t a, uint16_t b, uint8_t t) // t 0..255
   return RGB565(r, g, bl);
 }
 
-// ------------------------ integer sqrt ----------------------
 static inline int isqrt32(uint32_t n)
 {
   uint32_t x = n, c = 0, d = 1u << 30;
@@ -144,9 +150,11 @@ static inline int isqrt32(uint32_t n)
 static inline uint16_t *fbRow(int y) { return g_framebuffer + y * 240; }
 
 // ----------------------- touch ------------------------------
-bool tpTouch = false;        // true while finger is down (updated by pollTouch)
+bool tpTouch = false;
 uint16_t tpX = 120, tpY = 120;
+uint16_t pressX = 120, pressY = 120;
 bool tpAlive = false;
+uint32_t lastTouchAt = 0;
 
 bool readRegs(uint8_t reg, uint8_t *buf, uint8_t len)
 {
@@ -164,11 +172,10 @@ void touchInit()
   pinMode(T_RST, OUTPUT);
   digitalWrite(T_RST, LOW); delay(20);
   digitalWrite(T_RST, HIGH); delay(60);
-  Wire.begin(T_SDA, T_SCL, 100000U);   // 100kHz: far more robust than 400k here
+  Wire.begin(T_SDA, T_SCL, 100000U);
   Wire.setTimeOut(50);
 }
 
-// un-stick a hung I2C bus and reset the touch controller
 void touchReinit()
 {
   pinMode(T_SCL, OUTPUT);
@@ -190,23 +197,21 @@ uint16_t lastSampleX = 120, lastSampleY = 120;
 float strokeAccum = 0;
 uint32_t lastHeartAt = 0;
 
-// returns: 0=nothing, 1=just pressed, 2=still/moving down, 3=just released
-uint8_t pollTouch()
+uint8_t pollTouch()          // 0 none, 1 down, 2 move, 3 up
 {
   static bool wasDown = false;
   static bool broken = false;
   static uint32_t lastReinit = 0;
 
-  if (broken) {                    // recovering from a bus hang
+  if (broken) {
     if (millis() - lastReinit > 1500) { touchReinit(); broken = false; }
     return 0;
   }
-
   uint8_t r[6] = {0};
   uint32_t t0 = micros();
   bool ok = readRegs(0x01, r, 6);
   uint32_t elapsed = micros() - t0;
-  if (elapsed > 30000) {           // transaction took way too long: bus stuck
+  if (elapsed > 30000) {
     broken = true;
     lastReinit = millis();
     strokeAccum = 0;
@@ -230,13 +235,14 @@ uint8_t pollTouch()
 #endif
     tpX = x; tpY = y;
     tpTouch = true;
+    lastTouchAt = millis();
     if (!wasDown) {
       lastSampleX = x; lastSampleY = y;
+      pressX = x; pressY = y;
       strokeAccum = 0;
       wasDown = true;
       return 1;
     }
-    // accumulate stroke distance for petting
     int dx = (int)x - lastSampleX, dy = (int)y - lastSampleY;
     strokeAccum += sqrtf((float)(dx * dx + dy * dy));
     lastSampleX = x; lastSampleY = y;
@@ -247,78 +253,59 @@ uint8_t pollTouch()
   return 0;
 }
 
-// ----------------------- pet state --------------------------
+// ----------------------- pet identity -----------------------
+enum Personality : uint8_t { P_LAZY = 0, P_HYPER, P_PICKY, P_CUDDLY, P_COUNT };
+const char *P_NAME[P_COUNT] = { "LAZY", "HYPER", "PICKY", "CUDDLY" };
+const float P_HUE[P_COUNT] = { 210, 25, 110, 330 };
+
+enum Form : uint8_t { F_BALANCED = 0, F_CHUBBY, F_ATHLETIC, F_SPARKLY };
+const char *FORM_NAME[4] = { "", "CHUBBY", "ATHLETIC", "SPARKLY" };
+const float FORM_SCALE[4] = { 1.0f, 1.06f, 0.94f, 1.0f };
+
 enum PetState : uint8_t { ST_AWAKE = 0, ST_EATING, ST_PLAYING, ST_SLEEPING };
 enum Stage : uint8_t { STAGE_BABY = 0, STAGE_TEEN, STAGE_ADULT };
 const char *STAGE_NAME[] = { "BABY", "TEEN", "ADULT" };
 
-struct {
-  float hunger = 80, fun = 80, energy = 80;   // 0..100
+struct TamaData {
+  float hunger = 80, fun = 80, energy = 80;
   uint32_t ageSec = 0;
   bool hatched = false;
   PetState state = ST_AWAKE;
   Stage stage = STAGE_BABY;
+  Form form = F_BALANCED;
+  Personality pers = P_LAZY;
+  uint16_t fedCount = 0, playCount = 0, petCount = 0;   // care history
 } tama;
 
+// ------------------------ poops -----------------------------
+bool statsDirty = false;            // declared early: clearPoops uses it
 struct Poop { bool active; uint8_t slot; };
 Poop poops[4];
 const int16_t POOP_SPOTS[4][2] = { {44,146}, {196,146}, {86,174}, {154,174} };
+bool poopsActive(int i) { return poops[i].active; }
+void poopSet(int i, bool v) { poops[i].active = v; poops[i].slot = (uint8_t)i; }
+void clearPoops() { for (int i = 0; i < 4; i++) poopSet(i, false); statsDirty = true; }
 
-struct Particle {
-  bool active;
-  int16_t x, y;
-  int8_t vx, vy;
-  uint8_t life, type;   // 0 heart, 1 zzz, 2 crumb, 3 sparkle, 4 popring
-};
-Particle parts[24];
-
-float blinkPhase = 1.0f;
-bool blinking = false;
-uint32_t blinkStart = 0, nextBlink = 0;
-float gazeX = 0, gazeY = 0, tgtX = 0, tgtY = 0;
-uint32_t nextWander = 0;
-float breathe = 0;
-uint32_t happyUntil = 0;
-uint32_t refuseUntil = 0;      // head-shake "!"
-uint32_t eatStart = 0;
-uint32_t celebrateUntil = 0;
-uint32_t stateEnd = 0;         // generic end timestamp for EATING
-bool infoOverlay = false;
-bool virginBoot = false;
-bool orientPending = true;   // orientation self-test shown until first tap
-uint32_t bootAt = 0;
-uint32_t wakeGraceAt = 0;    // pet won't re-sleep this long after waking
-uint32_t infoOpenAt = 0;     // stats overlay opened at (for auto-dismiss)
-
-// mini-game
-struct Game {
-  bool active = false;
-  uint8_t round, hits;
-  int16_t tx, ty;
-  uint32_t roundStart;
-  bool waitNext;               // pause between rounds
-  uint32_t waitStart;
-} game;
-
-// frame pacing / fps
-uint32_t frameStart = 0, fpsFrames = 0, fpsT0 = 0;
-float fpsShown = 0;
-
-// persistence
+// ---------------------- persistence -------------------------
 Preferences prefs;
-bool statsDirty = false;
 uint32_t lastSaveAt = 0;
+bool virginBoot = false;
 
 void saveTamagotchi()
 {
-  prefs.begin("tama", false);   // read-write
+  prefs.begin("tama", false);
   prefs.putBool("hatched", tama.hatched);
   prefs.putUChar("hunger", (uint8_t)tama.hunger);
   prefs.putUChar("fun", (uint8_t)tama.fun);
   prefs.putUChar("energy", (uint8_t)tama.energy);
   prefs.putUInt("age", tama.ageSec);
+  prefs.putUChar("pers", tama.pers);
+  prefs.putUChar("form", tama.form);
+  prefs.putUShort("fed", tama.fedCount);
+  prefs.putUShort("play", tama.playCount);
+  prefs.putUShort("pet", tama.petCount);
   uint8_t pmask = 0;
-  for (int i = 0; i < 4; i++) if (poops[i].active) pmask |= (1 << i);
+  for (int i = 0; i < 4; i++) if (poopsActive(i)) pmask |= (1 << i);
   prefs.putUChar("poops", pmask);
   prefs.end();
   statsDirty = false;
@@ -334,273 +321,154 @@ void loadTamagotchi()
   tama.fun = prefs.getUChar("fun", 80);
   tama.energy = prefs.getUChar("energy", 80);
   tama.ageSec = prefs.getUInt("age", 0);
+  if (prefs.isKey("pers")) tama.pers = (Personality)prefs.getUChar("pers", P_LAZY);
+  else { tama.pers = (Personality)random(P_COUNT); dbg("[TAMA] rolled personality: %s\n", P_NAME[tama.pers]); }
+  tama.form = (Form)prefs.getUChar("form", F_BALANCED);
+  tama.fedCount = prefs.getUShort("fed", 0);
+  tama.playCount = prefs.getUShort("play", 0);
+  tama.petCount = prefs.getUShort("pet", 0);
   uint8_t pmask = prefs.getUChar("poops", 0);
   prefs.end();
-  for (int i = 0; i < 4; i++) poops[i] = { (pmask & (1 << i)) != 0, (uint8_t)i };
+  for (int i = 0; i < 4; i++) poopSet(i, (pmask & (1 << i)) != 0);
   tama.stage = tama.ageSec < 3600UL ? STAGE_BABY
              : tama.ageSec < 43200UL ? STAGE_TEEN : STAGE_ADULT;
 }
 
+// ------------------------ poops -----------------------------
+// (moved before persistence; see above)
+
+// ------------------------ particles -------------------------
+struct Particle {
+  bool active;
+  int16_t x, y;
+  int8_t vx, vy;
+  uint8_t life, type;   // 0 heart 1 zzz 2 crumb 3 sparkle 4 popring 5 tear
+};
+Particle parts[24];
+
 void spawnPart(uint8_t type, int16_t x, int16_t y, int8_t vx, int8_t vy, uint8_t life)
 {
   for (auto &p : parts) {
-    if (!p.active) {
-      p = { true, x, y, vx, vy, life, type };
-      return;
-    }
+    if (!p.active) { p = { true, x, y, vx, vy, life, type }; return; }
   }
 }
 
-void clearPoops()
+// ----------------------- mini-game --------------------------
+struct Game {
+  bool active = false;
+  uint8_t type;            // 0 pop, 1 catch
+  uint8_t round = 0;
+  uint8_t score, hits;
+  int16_t tx, ty;
+  uint32_t roundStart;
+  bool waitNext;
+  uint32_t waitStart;
+  uint32_t startMs;
+  // catch
+  struct { int16_t x, y; int8_t vy; bool on; } drops[3];
+} game;
+
+// game chooser (2 games)
+bool chooserOpen = false;
+const int16_t CHOICE[2][2] = { {70,118}, {170,118} };
+
+// ---------------------- mood / anim state -------------------
+float blinkPhase = 1.0f;
+bool blinking = false;
+uint32_t blinkStart = 0, nextBlink = 0;
+float gazeX = 0, gazeY = 0, tgtX = 0, tgtY = 0;
+uint32_t nextWander = 0;
+float breathe = 0;
+uint32_t happyUntil = 0;
+uint32_t celebrateUntil = 0;
+uint32_t grumpyUntil = 0;
+uint32_t curiousUntil = 0;
+uint32_t zoomUntil = 0, nextZoom = 0;
+struct BubbleState { uint8_t type = 0; uint32_t until = 0; } bubble;
+uint32_t lastBubble = 0;
+uint32_t stateEnd = 0;
+uint32_t eatStart = 0;
+uint32_t wakeGraceAt = 0;
+uint32_t infoOpenAt = 0;
+bool infoOverlay = false;
+bool orientPending = false;   // orientation self-test: verified once, now disabled
+                              // (re-enable with true if orientation ever needs rechecking)
+uint32_t bootAt = 0;
+uint32_t refuseUntil = 0;
+
+// ---------------------- time / wifi / battery ---------------
+bool wifiConnecting = false;
+uint32_t wifiStartAt = 0;
+bool timeSynced = false;
+uint32_t lastTimeCheck = 0;
+int curHour = -1, curMin = -1, curSec = -1, curDow = -1, curDay = -1, curMon = -1;
+float batteryPct = -1;
+uint32_t lastBatRead = 0;
+int probeRaw0 = -1, probeRaw1 = -1;      // battery pin discovery values
+
+bool isNight()
 {
-  for (auto &p : poops) p.active = false;
-  statsDirty = true;
+  return timeSynced && (curHour >= NIGHT_START_HOUR || curHour < NIGHT_END_HOUR);
 }
 
-// ------------------- sim (fixed timestep) -------------------
-uint32_t lastTick = 0;
+void startWifi()
+{
+  if (!WIFI_SSID[0] || wifiConnecting) return;
+  wifiConnecting = true;
+  wifiStartAt = millis();
+  dbg("[NET] wifi connecting...\n");
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("orb-tama");
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+void updateTime()
+{
+  if (!timeSynced) return;
+  if (millis() - lastTimeCheck < 1000) return;
+  lastTimeCheck = millis();
+  struct tm ti;
+  if (!getLocalTime(&ti, 0)) return;
+  curHour = ti.tm_hour; curMin = ti.tm_min; curSec = ti.tm_sec;
+  curDow = ti.tm_wday; curDay = ti.tm_mday; curMon = ti.tm_mon + 1;
+}
+
+void readBattery()
+{
+#if BATTERY_PIN >= 0
+  static bool announced = false;
+  pinMode(BATTERY_PIN, INPUT);
+  analogSetPinAttenuation(BATTERY_PIN, ADC_11db);
+  int raw = analogRead(BATTERY_PIN);
+  if (!announced) {
+    announced = true;
+    dbg("[BAT] pin%d raw=%d\n", BATTERY_PIN, raw);
+  }
+  if (raw > 700) {
+    batteryPct = constrain((raw - BAT_EMPTY_RAW) * 100.0f / (BAT_FULL_RAW - BAT_EMPTY_RAW), 0.0f, 100.0f);
+  } else batteryPct = -1;
+#endif
+}
+
+void probeBatteryPins()
+{
+  // discovery helper: no battery pin documented publicly - log ADC on the
+  // two candidates once at boot. Attach a LiPo and read the serial log.
+  pinMode(0, INPUT);
+  analogSetPinAttenuation(0, ADC_11db);
+  probeRaw0 = analogRead(0);
+  pinMode(1, INPUT);
+  analogSetPinAttenuation(1, ADC_11db);
+  probeRaw1 = analogRead(1);
+  dbg("[BAT] probe pin0=%d pin1=%d\n", probeRaw0, probeRaw1);
+  pinMode(T_RST, OUTPUT);   // restore touch reset
+  digitalWrite(T_RST, HIGH);
+}
+
+// frame pacing / fps (declared early: setup uses them)
+uint32_t frameStart = 0, fpsFrames = 0, fpsT0 = 0, lastTick = 0;
+float fpsShown = 0;
 uint32_t pendingMealPoop = 0;
-
-void simTick()   // every 250ms
-{
-  float dm = 0.25f / 60.0f * TIME_SCALE;       // simulated minutes elapsed
-  tama.ageSec += (uint32_t)(0.25f * TIME_SCALE);
-
-  bool anyPoop = false;
-  for (auto &p : poops) anyPoop |= p.active;
-
-  if (tama.state != ST_SLEEPING) {
-    tama.hunger -= 0.40f * dm;
-    tama.fun -= (anyPoop ? 0.56f : 0.28f) * dm;
-    tama.energy -= (tama.state == ST_PLAYING ? 0.0f : 0.15f) * dm;
-  } else {
-    tama.energy += 0.85f * dm;                 // sleeping recharges
-  }
-
-  if (tama.hunger < 0) tama.hunger = 0;
-  if (tama.fun < 0) tama.fun = 0;
-  if (tama.energy > 100) tama.energy = 100;
-
-  // meal -> eventual poop
-  if (pendingMealPoop && random(100) < 3) {
-    pendingMealPoop--;
-    for (auto &p : poops) {
-      if (!p.active) { p.active = true; statsDirty = true; break; }
-    }
-  }
-
-  // exhaustion -> sleep (with wake-grace so manual wake-ups stick)
-  if (tama.state == ST_AWAKE && tama.energy <= 8 &&
-      (int32_t)(millis() - wakeGraceAt) > 10000) {
-    tama.state = ST_SLEEPING;
-    statsDirty = true;
-    dbg("[TAMA] fell asleep\n");
-  }
-  if (tama.state == ST_SLEEPING) {
-    analogWrite(PIN_BL, BACKLIGHT_DIM);
-    if (tama.energy >= 40) {               // natural wake: recharge to 40
-      tama.state = ST_AWAKE;
-      wakeGraceAt = millis();
-      happyUntil = millis() + 1200;
-      analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
-      dbg("[TAMA] woke up rested\n");
-    }
-  }
-
-  // evolution
-  Stage st = tama.ageSec < 3600UL ? STAGE_BABY
-           : tama.ageSec < 43200UL ? STAGE_TEEN : STAGE_ADULT;
-  if (st != tama.stage) {
-    tama.stage = st;
-    celebrateUntil = millis() + 2200;
-    for (int i = 0; i < 10; i++)
-      spawnPart(3, 120 + random(-60, 61), 90 + random(-50, 51), 0, -2, 30);
-    dbg("[TAMA] evolved to %s!\n", STAGE_NAME[st]);
-  }
-
-  if (statsDirty && millis() - lastSaveAt > 60000) saveTamagotchi();
-
-  // periodic status log for remote verification
-  static uint32_t lastStatLog = 0;
-  if (millis() - lastStatLog > 60000) {
-    lastStatLog = millis();
-    dbg("[TAMA] age=%us h=%u f=%u e=%u stage=%s poops=%u\n",
-                  (unsigned)tama.ageSec, (uint8_t)tama.hunger, (uint8_t)tama.fun,
-                  (uint8_t)tama.energy, STAGE_NAME[tama.stage],
-                  poops[0].active + poops[1].active + poops[2].active + poops[3].active);
-  }
-}
-
-// ------------------- interaction ----------------------------
-const int16_t ICON[3][2] = { {58,186}, {120,198}, {182,186} };  // feed play clean
-
-bool hitIcon(int idx)
-{
-  int dx = tpX - ICON[idx][0], dy = tpY - ICON[idx][1];
-  return dx * dx + dy * dy <= 22 * 22;
-}
-
-bool hitPoop(int16_t &sx, int16_t &sy)
-{
-  for (auto &p : poops) {
-    if (!p.active) continue;
-    int dx = tpX - POOP_SPOTS[p.slot][0], dy = tpY - POOP_SPOTS[p.slot][1];
-    if (dx * dx + dy * dy <= 16 * 16) { sx = POOP_SPOTS[p.slot][0]; sy = POOP_SPOTS[p.slot][1]; return true; }
-  }
-  return false;
-}
-
-void headShake()
-{
-  refuseUntil = millis() + 800;
-}
-
-void startFeeding()
-{
-  if (tama.state != ST_AWAKE) return;
-  if (tama.hunger > 92) { headShake(); return; }
-  tama.state = ST_EATING;
-  eatStart = millis();
-  stateEnd = eatStart + 1900;
-}
-
-void startGame()
-{
-  if (tama.state != ST_AWAKE) return;
-  if (tama.energy < 15) { headShake(); return; }   // too tired
-  game.active = true;
-  game.round = 0;
-  game.hits = 0;
-  game.waitNext = false;
-  tama.state = ST_PLAYING;
-  nextGameTarget();
-}
-
-void nextGameTarget()
-{
-  for (int tries = 0; tries < 20; tries++) {
-    float a = random(0, 628) * 0.01f;
-    float rr = 30 + random(0, 46);
-    int x = 120 + (int)(cosf(a) * rr);
-    int y = 105 + (int)(sinf(a) * rr);
-    int dxF = x - ICON[0][0], dyF = y - ICON[0][1];
-    if (dxF * dxF + dyF * dyF < 30 * 30) continue;
-    game.tx = x; game.ty = y;
-    break;
-  }
-  game.roundStart = millis();
-  game.waitNext = false;
-}
-
-void endGame()
-{
-  game.active = false;
-  tama.fun += 8 + game.hits * 4;
-  if (tama.fun > 100) tama.fun = 100;
-  tama.energy -= 7;
-  if (tama.energy < 0) tama.energy = 0;
-  tama.state = ST_AWAKE;
-  happyUntil = millis() + 1400;
-  statsDirty = true;
-  spawnPart(3, 120, 60, 0, -1, 26);
-  dbg("[TAMA] game over hits=%u\n", game.hits);
-}
-
-void handleTap(uint16_t x, uint16_t y)
-{
-  int16_t sx, sy;
-
-  if (virginBoot) return;                       // still hatching
-  if (infoOverlay) { infoOverlay = false; return; }
-
-  if (tama.state == ST_PLAYING) {               // bubble-pop taps
-    if (game.active) handleTapGame(x, y);
-    return;
-  }
-  if (tama.state == ST_SLEEPING) {          // wake up
-    tama.state = ST_AWAKE;
-    wakeGraceAt = millis();
-    analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
-    happyUntil = millis() + 600;
-    statsDirty = true;
-    return;
-  }
-  if (tama.state != ST_AWAKE) return;
-
-  for (int i = 0; i < 3; i++) {
-    if (hitIcon(i)) {
-      if (i == 0) startFeeding();
-      else if (i == 1) startGame();
-      else {
-        bool any = poops[0].active || poops[1].active || poops[2].active || poops[3].active;
-        if (!any) {   // all clean: happy sparkle instead of a confusing head-shake
-          happyUntil = millis() + 800;
-          for (int k = 0; k < 4; k++) spawnPart(3, ICON[2][0] + random(-14, 15), ICON[2][1] - 10, 0, -2, 18);
-        } else {
-          clearPoops();
-          celebrateUntil = millis() + 800;
-        }
-      }
-      return;
-    }
-  }
-  if (hitPoop(sx, sy)) {                    // swipe-free single cleanup
-    for (auto &p : poops)
-      if (p.active && POOP_SPOTS[p.slot][0] == sx && POOP_SPOTS[p.slot][1] == sy) p.active = false;
-    statsDirty = true;
-    spawnPart(3, sx, sy, 0, -1, 20);
-    return;
-  }
-  // plain poke on the creature
-  int dx = x - 120, dy = y - 104;
-  if (dx * dx + dy * dy < 95 * 95) {
-    happyUntil = millis() + 1000;
-    tama.fun += 2;
-    if (tama.fun > 100) tama.fun = 100;
-    statsDirty = true;
-  }
-}
-
-void handleTouchFrame()
-{
-  uint8_t ev = pollTouch();
-  static uint32_t downAt = 0;
-  static bool longFired = false;
-  static bool moved = false;
-
-  if (ev == 1) {                            // pressed
-    downAt = millis();
-    longFired = false;
-    moved = false;
-  } else if (ev == 2) {                     // held / moving
-    if (strokeAccum > 26) moved = true;
-    // petting: drag across the creature
-    if (tama.state == ST_AWAKE && moved && !infoOverlay &&
-        millis() - lastHeartAt > 180) {
-      int dx = tpX - 120, dy = tpY - 104;
-      if (dx * dx + dy * dy < 95 * 95) {
-        lastHeartAt = millis();
-        happyUntil = millis() + 1200;
-        tama.fun += 1.6f;
-        if (tama.fun > 100) tama.fun = 100;
-        statsDirty = true;
-        spawnPart(0, tpX, tpY - 12, 0, -2, 22);
-        strokeAccum = 0;
-      }
-    }
-    if (!longFired && millis() - downAt > 700 &&
-        strokeAccum < 14 && tama.state == ST_AWAKE) {
-      longFired = true;
-      infoOpenAt = millis();
-      infoOverlay = !infoOverlay;
-    }
-  } else if (ev == 3) {                     // released
-    if (orientPending) { orientPending = false; return; }   // dismiss self-test
-    if (!longFired && !moved && millis() - downAt < 500) {
-      handleTap(tpX, tpY);
-    }
-  }
-}
 
 // =========================== SETUP ==========================
 void setup()
@@ -619,6 +487,10 @@ void setup()
 
   touchInit();
   loadTamagotchi();
+  probeBatteryPins();
+#if BATTERY_PIN >= 0
+  readBattery();
+#endif
 
   // welcome-back care package: a neglected pet is always approachable
   bool rescued = false;
@@ -628,9 +500,10 @@ void setup()
   if (rescued) {
     statsDirty = true;
     dbg("[TAMA] welcome-back boost h=%u f=%u e=%u\n",
-                  (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy);
+        (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy);
   }
 
+  startWifi();
   bootAt = millis();
   fpsT0 = millis();
 }
@@ -650,13 +523,36 @@ void loop()
     if (dSim > 50000) dbg("[PERF] simTick %lums\n", (unsigned long)(dSim / 1000));
   }
 
-  if (infoOverlay && nowMs - infoOpenAt > 5000) infoOverlay = false;  // never gets stuck
+  if (infoOverlay && nowMs - infoOpenAt > 8000) infoOverlay = false;  // never gets stuck
+
+  // network bookkeeping
+  if (wifiConnecting && nowMs - wifiStartAt > 8000) {
+    wifiConnecting = false;
+    dbg("[NET] wifi timeout\n");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!timeSynced && nowMs - lastTimeCheck > 2000) {
+      lastTimeCheck = nowMs;
+      struct tm ti;
+      if (getLocalTime(&ti, 0)) {
+        timeSynced = true;
+        curHour = ti.tm_hour; curMin = ti.tm_min; curSec = ti.tm_sec;
+        curDow = ti.tm_wday; curDay = ti.tm_mday; curMon = ti.tm_mon + 1;
+        dbg("[NET] NTP synced\n");
+      }
+    }
+    updateTime();
+  } else if (timeSynced) {
+    // lost wifi: keep last known time, it drifts but is harmless
+  }
+  if (millis() - lastBatRead > 5000) { lastBatRead = millis(); readBattery(); }
 
   if (tama.state == ST_EATING && (int32_t)(stateEnd - nowMs) < 0) {
     tama.state = ST_AWAKE;
     tama.hunger += 24;
     if (tama.hunger > 100) tama.hunger = 100;
     pendingMealPoop++;
+    tama.fedCount++;
     happyUntil = nowMs + 1000;
     statsDirty = true;
     dbg("[TAMA] fed h=%u\n", (uint8_t)tama.hunger);
@@ -677,51 +573,413 @@ void loop()
   if (nowMs - fpsT0 >= 1000) {
     fpsShown = fpsFrames * 1000.0f / (nowMs - fpsT0);
     fpsFrames = 0; fpsT0 = nowMs;
-    dbg("[TAMA] %s %.1ffps h=%u\n", STAGE_NAME[tama.stage], fpsShown, ESP.getFreeHeap());
+    dbg("[TAMA] %s %s %.1ffps h=%u\n", STAGE_NAME[tama.stage],
+        P_NAME[tama.pers], fpsShown, ESP.getFreeHeap());
   }
 
   int32_t budget = 22000 - (int32_t)(micros() - frameStart);
   if (budget > 0) delayMicroseconds(budget);
 
-  // diagnostic: flag abnormally slow frames (stuck I2C / NVS writes)
   uint32_t frameCost = micros() - frameStart;
   if (frameCost > 200000)
     dbg("[TP] slow frame %lums\n", (unsigned long)(frameCost / 1000));
 }
 
-// ------------------------- mini-game ------------------------
+// ------------------------- simulation -----------------------
+// returns a Form value; uint8_t because the Arduino auto-prototype
+// block is emitted before user type declarations, so custom return
+// types in signatures can't be used
+uint8_t calcForm()
+{
+  uint32_t m = max(tama.fedCount, max(tama.playCount, tama.petCount));
+  if (m == 0) return F_BALANCED;
+  int best = 0;
+  if (tama.fedCount == m) best++;
+  if (tama.playCount == m) best++;
+  if (tama.petCount == m) best++;
+  if (best > 1) return F_BALANCED;              // tie -> balanced
+  if (tama.fedCount == m) return F_CHUBBY;
+  if (tama.playCount == m) return F_ATHLETIC;
+  return F_SPARKLY;
+}
+
+void simTick()
+{
+  float dm = 0.25f / 60.0f * TIME_SCALE;
+  tama.ageSec += (uint32_t)(0.25f * TIME_SCALE);
+
+  // personality multipliers
+  float enD = 1.0f, huD = 1.0f, fuD = 1.0f;
+  if (tama.pers == P_LAZY)   { enD = 0.7f; huD = 1.2f; }
+  if (tama.pers == P_HYPER)  { fuD = 0.6f; enD = 1.3f; }
+  if (tama.pers == P_PICKY)  { huD = 1.15f; }
+  if (tama.pers == P_CUDDLY) { fuD = 0.5f; }
+
+  bool anyPoop = false;
+  for (int i = 0; i < 4; i++) anyPoop |= poopsActive(i);
+
+  bool night = isNight();
+  if (tama.state != ST_SLEEPING) {
+    tama.hunger -= 0.40f * huD * dm;
+    tama.fun -= (anyPoop ? 0.56f : 0.28f) * fuD * dm;
+    tama.energy -= (tama.state == ST_PLAYING ? 0.0f : 0.15f) * enD * dm;
+  } else {
+    tama.energy += 0.85f * dm;
+  }
+  if (tama.hunger < 0) tama.hunger = 0;
+  if (tama.fun < 0) tama.fun = 0;
+  if (tama.energy > 100) tama.energy = 100;
+
+  if (pendingMealPoop && random(100) < 3) {
+    pendingMealPoop--;
+    for (int i = 0; i < 4; i++) if (!poopsActive(i)) { poopSet(i, true); statsDirty = true; break; }
+  }
+
+  // sleep logic: exhaustion OR night bedtime
+  if (tama.state == ST_AWAKE &&
+      ((tama.energy <= 8) || (night && tama.energy < 70)) &&
+      (int32_t)(millis() - wakeGraceAt) > 10000) {
+    tama.state = ST_SLEEPING;
+    statsDirty = true;
+    dbg("[TAMA] fell asleep (%s)\n", night ? "night" : "tired");
+  }
+  if (tama.state == ST_SLEEPING) {
+    analogWrite(PIN_BL, BACKLIGHT_DIM);
+    bool wake = night ? (curHour >= NIGHT_END_HOUR && tama.energy >= 40)
+                      : (tama.energy >= 40);
+    if (wake) {
+      tama.state = ST_AWAKE;
+      wakeGraceAt = millis();
+      happyUntil = millis() + 1200;
+      analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
+      dbg("[TAMA] woke up rested\n");
+    }
+  }
+
+  // zoomies: full fun + full energy = the zoomies
+  if (tama.state == ST_AWAKE && !night &&
+      tama.fun >= 90 && tama.energy >= 90 && (int32_t)(millis() - nextZoom) >= 0) {
+    zoomUntil = millis() + 2600;
+    tama.fun -= 8;
+    tama.energy -= 6;
+    nextZoom = millis() + 60000 + random(90000);
+    dbg("[TAMA] ZOOMIES!\n");
+  }
+
+  // evolution with care-based form
+  Stage st = tama.ageSec < 3600UL ? STAGE_BABY
+           : tama.ageSec < 43200UL ? STAGE_TEEN : STAGE_ADULT;
+  if (st != tama.stage) {
+    tama.stage = st;
+    Form f = (Form)calcForm();
+    if (f != F_BALANCED) {
+      tama.form = f;
+      dbg("[TAMA] evolved to %s %s!\n", STAGE_NAME[st], FORM_NAME[f]);
+    } else {
+      dbg("[TAMA] evolved to %s!\n", STAGE_NAME[st]);
+    }
+    celebrateUntil = millis() + 2200;
+    for (int i = 0; i < 10; i++)
+      spawnPart(3, 120 + random(-60, 61), 90 + random(-50, 51), 0, -2, 30);
+    statsDirty = true;
+  }
+
+  if (statsDirty && millis() - lastSaveAt > 60000) saveTamagotchi();
+
+  static uint32_t lastStatLog = 0;
+  if (millis() - lastStatLog > 60000) {
+    lastStatLog = millis();
+    dbg("[TAMA] age=%us h=%u f=%u e=%u %s/%s poops=%u fed=%u ply=%u pet=%u bat0=%d bat1=%d\n",
+        (unsigned)tama.ageSec, (uint8_t)tama.hunger, (uint8_t)tama.fun,
+        (uint8_t)tama.energy, STAGE_NAME[tama.stage], P_NAME[tama.pers],
+        poopsActive(0) + poopsActive(1) + poopsActive(2) + poopsActive(3),
+        tama.fedCount, tama.playCount, tama.petCount, probeRaw0, probeRaw1);
+  }
+}
+
+// ------------------------ interaction -----------------------
+const int16_t ICON[3][2] = { {58,186}, {120,198}, {182,186} };  // feed games clean
+
+bool hitIcon(int idx)
+{
+  int dx = tpX - ICON[idx][0], dy = tpY - ICON[idx][1];
+  return dx * dx + dy * dy <= 26 * 26;
+}
+
+bool hitPt(int px, int py, int cx, int cy, int r)
+{
+  int dx = px - cx, dy = py - cy;
+  return dx * dx + dy * dy <= r * r;
+}
+
+bool hitPoop()
+{
+  for (int i = 0; i < 4; i++) {
+    if (poopsActive(i) && hitPt(tpX, tpY, POOP_SPOTS[i][0], POOP_SPOTS[i][1], 16)) return true;
+  }
+  return false;
+}
+
+void headShake() { refuseUntil = millis() + 800; }
+
+void startFeeding()
+{
+  if (tama.state != ST_AWAKE || chooserOpen) return;
+  if (tama.hunger > 92) { headShake(); return; }
+  tama.state = ST_EATING;
+  eatStart = millis();
+  stateEnd = eatStart + 1900;
+}
+
+void startGame(uint8_t type)
+{
+  if (tama.state != ST_AWAKE) return;
+  if (tama.energy < 15) { headShake(); return; }
+  game.active = true;
+  game.type = type;
+  game.score = 0;
+  game.hits = 0;
+  game.startMs = millis();
+  game.waitNext = false;
+  if (type == 0) {                 // pop
+    game.round = 0;
+    nextGameTarget();
+  } else if (type == 1) {          // catch
+    for (int i = 0; i < 3; i++) game.drops[i].on = false;
+    game.roundStart = millis();
+  }
+  tama.state = ST_PLAYING;
+}
+
+void endGame()
+{
+  game.active = false;
+  chooserOpen = false;
+  tama.playCount++;
+  if (game.type == 0) tama.fun += 8 + game.hits * 4;
+  else if (game.type == 1) tama.fun += 6 + game.score * 4;
+  else tama.fun += 4 + game.score * 3;
+  if (tama.fun > 100) tama.fun = 100;
+  tama.energy -= 7;
+  if (tama.energy < 0) tama.energy = 0;
+  tama.state = ST_AWAKE;
+  happyUntil = millis() + 1400;
+  statsDirty = true;
+  spawnPart(3, 120, 60, 0, -1, 26);
+  dbg("[TAMA] game over type=%u score=%u\n", game.type, game.score);
+}
+
+void nextGameTarget()
+{
+  for (int tries = 0; tries < 20; tries++) {
+    float a = random(0, 628) * 0.01f;
+    float rr = 30 + random(0, 46);
+    int x = 120 + (int)(cosf(a) * rr);
+    int y = 105 + (int)(sinf(a) * rr);
+    if (hitPt(x, y, ICON[0][0], ICON[0][1], 30)) continue;
+    game.tx = x; game.ty = y;
+    break;
+  }
+  game.roundStart = millis();
+  game.waitNext = false;
+}
+
+void handleTap(uint16_t x, uint16_t y)
+{
+  if (virginBoot) return;
+  if (infoOverlay) { infoOverlay = false; return; }
+
+  if (chooserOpen) {               // picking a game
+    for (int g = 0; g < 2; g++) {
+      if (hitPt(x, y, CHOICE[g][0], CHOICE[g][1], 40)) {
+        chooserOpen = false;
+        startGame(g);
+        return;
+      }
+    }
+    chooserOpen = false;           // tap elsewhere cancels
+    return;
+  }
+
+  if (tama.state == ST_PLAYING) { if (game.active) handleTapGame(x, y); return; }
+
+  if (tama.state == ST_SLEEPING) {
+    tama.state = ST_AWAKE;
+    wakeGraceAt = millis();
+    grumpyUntil = millis() + 900;
+    analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
+    happyUntil = millis() + 600;
+    statsDirty = true;
+    return;
+  }
+  if (tama.state != ST_AWAKE) return;
+
+  // double-tap opens the stats panel
+  static uint32_t lastTapAt = 0;
+  static uint16_t lastTapX = 0, lastTapY = 0;
+  if (millis() - lastTapAt < 350 && abs((int)x - lastTapX) < 45 && abs((int)y - lastTapY) < 45) {
+    lastTapAt = 0;
+    infoOpenAt = millis();
+    infoOverlay = true;
+    return;
+  }
+  lastTapAt = millis();
+  lastTapX = x; lastTapY = y;
+
+  // top strip is always a stats shortcut
+  if (y < 45) { infoOpenAt = millis(); infoOverlay = true; return; }
+
+  for (int i = 0; i < 3; i++) {
+    if (hitIcon(i)) {
+      if (i == 0) startFeeding();
+      else if (i == 1) {
+        if (game.active) return;
+        chooserOpen = !chooserOpen;
+      } else {
+        bool any = false;
+        for (int k = 0; k < 4; k++) any |= poopsActive(k);
+        if (!any) {
+          happyUntil = millis() + 800;
+          for (int k = 0; k < 4; k++) spawnPart(3, ICON[2][0] + random(-14, 15), ICON[2][1] - 10, 0, -2, 18);
+        } else { clearPoops(); celebrateUntil = millis() + 800; }
+      }
+      return;
+    }
+  }
+  if (hitPoop()) {
+    for (int i = 0; i < 4; i++)
+      if (poopsActive(i) && hitPt(tpX, tpY, POOP_SPOTS[i][0], POOP_SPOTS[i][1], 16))
+        poopSet(i, false);
+    statsDirty = true;
+    spawnPart(3, x, y, 0, -1, 20);
+    return;
+  }
+  if (hitPt(x, y, 120, 104, 95)) {
+    happyUntil = millis() + 1000;
+    tama.fun += 2;
+    if (tama.fun > 100) tama.fun = 100;
+    statsDirty = true;
+  }
+}
+
+void handleTouchFrame()
+{
+  uint8_t ev = pollTouch();
+  static uint32_t downAt = 0;
+  static bool longFired = false;
+  static bool moved = false;
+
+  if (ev == 1) {
+    downAt = millis();
+    longFired = false;
+    moved = false;
+  } else if (ev == 2) {
+    if (strokeAccum > 26) moved = true;
+    int driftX = abs((int)tpX - pressX), driftY = abs((int)tpY - pressY);
+    int maxDrift = max(driftX, driftY);
+    // petting: needs real movement away from the press point
+    if (tama.state == ST_AWAKE && !chooserOpen && moved && !infoOverlay &&
+        maxDrift > 14 && millis() - lastHeartAt > 180) {
+      int dx = tpX - 120, dy = tpY - 104;
+      if (dx * dx + dy * dy < 95 * 95) {
+        lastHeartAt = millis();
+        happyUntil = millis() + 1200;
+        tama.fun += (tama.pers == P_CUDDLY ? 2.0f : 1.6f);
+        if (tama.fun > 100) tama.fun = 100;
+        tama.petCount++;
+        statsDirty = true;
+        spawnPart(0, tpX, tpY - 12, 0, -2, 22);
+        strokeAccum = 0;
+      }
+    }
+    // hold: finger stayed put (very tolerant) - ALWAYS opens (no toggle)
+    if (!longFired && millis() - downAt > 500 && maxDrift < 50 && !chooserOpen) {
+      longFired = true;
+      infoOpenAt = millis();
+      infoOverlay = true;
+      for (int k = 0; k < 4; k++)
+        spawnPart(3, 120 + random(-70, 71), 116 + random(-70, 71), 0, -1, 20);
+      dbg("[UI] HOLD opened stats (drift %d)\n", maxDrift);
+    }
+  } else if (ev == 3) {
+    if (orientPending) { orientPending = false; return; }
+    if (longFired || moved || millis() - downAt >= 500) return;
+    // swipe gestures: left = feed, right = clean
+    int ddx = (int)tpX - pressX, ddy = (int)tpY - pressY;
+    if (abs(ddx) >= 55 && abs(ddy) <= 45) {
+      if (ddx < 0) startFeeding();
+      else {
+        bool any = false;
+        for (int k = 0; k < 4; k++) any |= poopsActive(k);
+        if (any) clearPoops();
+      }
+      return;
+    }
+    handleTap(tpX, tpY);
+  }
+}
+
+// ------------------------- mini-games -----------------------
 void tickGame()
 {
   uint32_t nowMs = millis();
-  if (game.waitNext) {
-    if (nowMs - game.waitStart > 450) {
-      if (game.round >= 5) endGame();
-      else nextGameTarget();
+  if (game.type == 0) {                 // pop
+    if (game.waitNext) {
+      if (nowMs - game.waitStart > 450) {
+        if (game.round >= 5) endGame();
+        else nextGameTarget();
+      }
+      return;
     }
-    return;
+    if (nowMs - game.roundStart > 3200) {
+      game.round++;
+      game.waitNext = true;
+      game.waitStart = nowMs;
+    }
+  } else if (game.type == 1) {          // catch
+    if (nowMs - game.startMs > 22000) { endGame(); return; }
+    for (int i = 0; i < 3; i++) {
+      if (!game.drops[i].on) {
+        if (random(100) < 4) {          // spawn
+          game.drops[i].on = true;
+          game.drops[i].x = 60 + random(121);
+          game.drops[i].y = -8;
+          game.drops[i].vy = 1 + random(2);
+        }
+      } else {
+        game.drops[i].y += game.drops[i].vy * 2;
+        if (game.drops[i].y > 235) game.drops[i].on = false;   // missed
+      }
+    }
   }
-  // timeout?
-  if (nowMs - game.roundStart > 3200) {
-    game.round++;
-    game.waitNext = true;
-    game.waitStart = nowMs;
-  }
-  // hit test happens on tap (see handleTapGame)
 }
 
 void handleTapGame(uint16_t x, uint16_t y)
 {
-  if (game.waitNext) return;
-  int dx = x - game.tx, dy = y - game.ty;
-  int r = 20 + (millis() - game.roundStart > 2400 ? -6 : 0); // shrinks late
-  if (dx * dx + dy * dy <= r * r) {
-    game.hits++;
-    for (int i = 0; i < 6; i++)
-      spawnPart(2, game.tx, game.ty, random(-3, 4), random(-4, 1), 14);
-    spawnPart(4, game.tx, game.ty, 0, 0, 10);
-    game.round++;
-    game.waitNext = true;
-    game.waitStart = millis();
+  if (game.type == 0) {                 // pop
+    if (game.waitNext) return;
+    int dx = x - game.tx, dy = y - game.ty;
+    int r = 24 + (millis() - game.roundStart > 2400 ? -8 : 0);
+    if (dx * dx + dy * dy <= r * r) {
+      game.hits++;
+      for (int i = 0; i < 6; i++)
+        spawnPart(2, game.tx, game.ty, random(-3, 4), random(-4, 1), 14);
+      spawnPart(4, game.tx, game.ty, 0, 0, 10);
+      game.round++;
+      game.waitNext = true;
+      game.waitStart = millis();
+    }
+  } else if (game.type == 1) {          // catch
+    for (int i = 0; i < 3; i++) {
+      if (game.drops[i].on && hitPt(x, y, game.drops[i].x, game.drops[i].y, 26)) {
+        game.drops[i].on = false;
+        game.score++;
+        spawnPart(4, game.drops[i].x, game.drops[i].y, 0, 0, 10);
+        spawnPart(3, game.drops[i].x, game.drops[i].y, 0, -1, 16);
+        if (game.score >= 5) endGame();
+        return;
+      }
+    }
   }
 }
 
@@ -729,17 +987,27 @@ void handleTapGame(uint16_t x, uint16_t y)
 void updateLook(uint32_t tms)
 {
   breathe = sinf(tms * (2 * PI / 4200.0f));
+  bool zooming = (int32_t)(zoomUntil - tms) > 0;
+  bool playing = (tama.state == ST_PLAYING && game.active);
+  bool night = isNight();
 
-  bool chasing = (tama.state == ST_PLAYING && game.active && !game.waitNext);
-  if (chasing) {
-    tgtX = constrain((float)game.tx - 120, -70, 70) * 0.6f;
-    tgtY = constrain((float)game.ty - 104, -60, 60) * 0.6f;
-  } else if (tpTouchLive()) {
+  if (zooming) {
+    // override: eyes dart side to side during zoomies
+    tgtX = sinf(tms * 0.04f) * 60;
+    tgtY = 0;
+  } else if (playing) {
+    if (game.type == 0 && !game.waitNext) {
+      tgtX = constrain((float)game.tx - 120, -70, 70) * 0.6f;
+      tgtY = constrain((float)game.ty - 104, -60, 60) * 0.6f;
+    } else { tgtX = 0; tgtY = 0; }
+  } else if (tpTouch) {
     tgtX = constrain((float)tpX - 120, -70, 70) * 0.55f;
     tgtY = constrain((float)tpY - 104, -60, 60) * 0.55f;
-  } else if (refuseActive()) {
+  } else if ((int32_t)(refuseUntil - tms) > 0) {
     tgtX = sinf(tms * 0.04f) * 14;
     tgtY = 0;
+  } else if ((int32_t)(grumpyUntil - tms) > 0) {
+    tgtX = -16; tgtY = 0;                // averted gaze
   } else {
     if ((int32_t)(tms - nextWander) >= 0) {
       nextWander = tms + 1500 + random(2800);
@@ -750,8 +1018,9 @@ void updateLook(uint32_t tms)
   gazeX += (tgtX - gazeX) * 0.18f;
   gazeY += (tgtY - gazeY) * 0.18f;
 
-  // blinking (not while sleeping - eyes stay shut)
+  // blinking (not while sleeping)
   if (tama.state != ST_SLEEPING) {
+    uint32_t blinkRange = (tama.pers == P_HYPER) ? 2600 : 4500;
     if (!blinking && (int32_t)(tms - nextBlink) >= 0) {
       blinking = true;
       blinkStart = tms;
@@ -763,28 +1032,36 @@ void updateLook(uint32_t tms)
       if (dt >= 180) {
         blinking = false;
         blinkPhase = 1.0f;
-        nextBlink = tms + 2200 + random(4500);
+        nextBlink = tms + blinkRange + random(blinkRange);
       }
     } else blinkPhase = 1.0f;
   }
 
-  // particles live in real time
+  // curiosity
+  if (tama.state == ST_AWAKE && !night && !zooming && !playing &&
+      (int32_t)(tms - lastTouchAt) > 20000 && (int32_t)(curiousUntil - tms) <= 0) {
+    curiousUntil = tms + 1600;
+  }
+
+  // speech bubbles (need-based, rate-limited)
+  if (bubble.until < tms && tama.state == ST_AWAKE && !night &&
+      (int32_t)(tms - lastBubble) > 30000) {
+    uint8_t bt = 0;
+    if (tama.hunger < 30) bt = 1;
+    else if (tama.fun < 30) bt = 2;
+    else if (tama.energy < 12) bt = 3;
+    else if (random(100) < 20) bt = 5;
+    if (bt) { bubble.type = bt; bubble.until = tms + 4500; lastBubble = tms; }
+  }
+  if (bubble.until < tms) bubble.type = 0;
+
+  // particles (real time)
   for (auto &p : parts) {
     if (!p.active) continue;
     p.x += p.vx; p.y += p.vy;
     if (p.life) p.life--;
     if (!p.life) p.active = false;
   }
-}
-
-bool tpTouchLive()
-{
-  return tpTouch;   // maintained directly by pollTouch
-}
-
-bool refuseActive()
-{
-  return (int32_t)(refuseUntil - millis()) > 0;
 }
 
 // ========================== RENDER ==========================
@@ -794,14 +1071,18 @@ void renderScene(uint32_t tms)
   for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = COL_BG;
 
   if (orientPending) {
-    if (tms - bootAt > 10000) orientPending = false;   // auto-dismiss fallback
-    else drawOrientationTest();
+    if (tms - bootAt > 10000) orientPending = false;
+    else { drawOrientationTest(); return; }
+  }
+  if (virginBoot) { drawEggIntro(tms); return; }
+
+  // night sleep = ambient clock face
+  if (tama.state == ST_SLEEPING && isNight()) {
+    drawNightClock();
     return;
   }
 
   drawGaugeRing();
-
-  // body disc + rim light
   cv->fillCircle(120, 108, 84, COL_BODY);
   for (float a = 100; a <= 175; a += 4) {
     float rad = a * DEG_TO_RAD;
@@ -812,52 +1093,12 @@ void renderScene(uint32_t tms)
   drawPet(tms);
   drawParticles();
   drawIcons();
+  if (chooserOpen) drawChooser();
   if (infoOverlay) drawInfo();
-  if (virginBoot) drawEggIntro(tms);
   if (game.active) drawGameOverlay(tms);
 }
 
-// ---------------------- orientation test --------------------
-void drawOrientationTest()
-{
-  uint16_t *fb = cv->getFramebuffer();
-  for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = RGB565(10, 10, 14);
-
-  cv->setFont(&FreeSansBold12pt7b);
-  drawCenteredString("TOP", 120, 22, RGB565(255, 255, 255));
-  drawCenteredString("BOTTOM", 120, 218, RGB565(255, 255, 255));
-  cv->setFont(&FreeSansBold18pt7b);
-  drawCenteredString("L", 24, 120, RGB565(120, 200, 255));
-  drawCenteredString("R", 216, 120, RGB565(120, 200, 255));
-
-  // big arrow pointing "up"
-  int cx = 120, cy = 116;
-  cv->fillTriangle(cx, cy - 22, cx - 14, cy + 2, cx + 14, cy + 2, RGB565(255, 200, 60));
-  cv->fillRect(cx - 3, cy + 2, 6, 18, RGB565(255, 200, 60));
-
-  cv->setFont(&FreeSansBold9pt7b);
-  drawCenteredString("tap to continue", 120, 176, RGB565(140, 150, 170));
-}
-
-// ---- stat ring: three colored arc segments around the bezel ----
-void drawGaugeRing()
-{
-  arcTrack(150, 100, COL_TRACK);   // hunger sector (upper left)
-  arcTrack(30, 100, COL_TRACK);    // fun sector (upper right)
-  arcTrack(270, 100, COL_TRACK);   // energy sector (bottom)
-
-  uint8_t hq = (uint8_t)(tama.hunger * 2.55f);
-  uint8_t fq = (uint8_t)(tama.fun * 2.55f);
-  uint8_t eq = (uint8_t)(tama.energy * 2.55f);
-  uint16_t hc = lerpColor(COL_BAD, COL_GOOD, hq);
-  uint16_t fc = lerpColor(RGB565(120, 120, 140), COL_HEART, fq);
-  uint16_t ec = lerpColor(COL_BAD, RGB565(90, 190, 255), eq);
-
-  arcValue(150, hq, hc);
-  arcValue(30, fq, fc);
-  arcValue(270, eq, ec);
-}
-
+// ---- stat ring + battery ----
 void arcDot(int r, float angDeg, uint16_t c)
 {
   float rad = angDeg * DEG_TO_RAD;
@@ -880,17 +1121,35 @@ void arcValue(int centerDeg, uint8_t q, uint16_t c)
   for (float a = centerDeg - half; a <= centerDeg + half; a += 3.5f) arcDot(113, a, c);
 }
 
+void drawGaugeRing()
+{
+  arcTrack(150, 100, COL_TRACK);
+  arcTrack(30, 100, COL_TRACK);
+  arcTrack(270, 100, COL_TRACK);
+  arcTrack(90, 100, COL_TRACK);          // battery sector (top)
+
+  uint8_t hq = (uint8_t)(tama.hunger * 2.55f);
+  uint8_t fq = (uint8_t)(tama.fun * 2.55f);
+  uint8_t eq = (uint8_t)(tama.energy * 2.55f);
+  arcValue(150, hq, lerpColor(COL_BAD, COL_GOOD, hq));
+  arcValue(30, fq, lerpColor(RGB565(120, 120, 140), COL_HEART, fq));
+  arcValue(270, eq, lerpColor(COL_BAD, RGB565(90, 190, 255), eq));
+  if (batteryPct >= 0) {
+    uint8_t bq = (uint8_t)(batteryPct * 2.55f);
+    arcValue(90, bq, lerpColor(COL_BAD, COL_GOOD, bq));
+  }
+}
+
 // --------------------------- poops --------------------------
 void drawPoops(uint32_t tms)
 {
-  for (auto &p : poops) {
-    if (!p.active) continue;
-    int x = POOP_SPOTS[p.slot][0], y = POOP_SPOTS[p.slot][1];
+  for (int i = 0; i < 4; i++) {
+    if (!poopsActive(i)) continue;
+    int x = POOP_SPOTS[i][0], y = POOP_SPOTS[i][1];
     cv->fillCircle(x, y + 3, 7, COL_POOP);
     cv->fillCircle(x - 3, y - 2, 5, COL_POOP);
     cv->fillCircle(x + 3, y - 3, 4, COL_POOP);
     cv->fillCircle(x, y - 7, 3, COL_POOP);
-    // little stink wisp
     if ((tms >> 8) & 1) cv->drawLine(x + 8, y - 8, x + 11, y - 12, RGB565(110, 130, 90));
   }
 }
@@ -898,17 +1157,20 @@ void drawPoops(uint32_t tms)
 // ============================ PET ===========================
 void drawPet(uint32_t tms)
 {
-  float scale = tama.stage == STAGE_BABY ? 0.72f
-              : tama.stage == STAGE_TEEN ? 0.88f : 1.0f;
+  float scale = (tama.stage == STAGE_BABY ? 0.72f : tama.stage == STAGE_TEEN ? 0.88f : 1.0f)
+              * FORM_SCALE[tama.form];
 
-  float hue = fmodf(tms * 0.006f + tama.stage * 90.0f, 360.0f);
+  float hue = fmodf(tms * 0.006f + tama.stage * 90.0f + P_HUE[tama.pers], 360.0f);
   uint16_t irisCol  = hsv565(hue, 0.72f, 0.85f);
   uint16_t irisDark = hsv565(hue, 0.85f, 0.45f);
 
   bool happy = happyUntil && (int32_t)(happyUntil - tms) > 0;
   bool celebrating = (int32_t)(celebrateUntil - tms) > 0;
+  bool grumpy = (int32_t)(grumpyUntil - tms) > 0;
+  bool curious = (int32_t)(curiousUntil - tms) > 0;
+  bool zooming = (int32_t)(zoomUntil - tms) > 0;
   bool sleeping = tama.state == ST_SLEEPING;
-  bool sad = !sleeping && !happy &&
+  bool sad = !sleeping && !happy && !grumpy && !zooming &&
              (tama.hunger < 25 || tama.fun < 20 || tama.energy < 15);
 
   float squash = 1.0f;
@@ -916,51 +1178,60 @@ void drawPet(uint32_t tms)
   else if (happy || celebrating) squash = 0.62f + 0.06f * sinf(tms * 0.02f);
   else if (sad) squash = 0.82f;
 
-  float droop = sad ? 0.88f : 1.0f;         // sad = heavy eyelids
-  int ry = (int)((42.0f * squash * droop) * scale * (sleeping ? 1.0f : (1.0f - 0.96f * (1.0f - blinkPhase))));
+  float droop = sad ? 0.88f : 1.0f;
+  int ry = (int)((42.0f * squash * droop) * scale *
+                 (sleeping ? 1.0f : (1.0f - 0.96f * (1.0f - blinkPhase))));
   int rx = (int)(44.0f * scale * (1.0f + 0.02f * breathe));
   if (ry < 2) ry = 2;
   int irisR = (int)(21 * scale), pupR = (int)(11 * scale);
+  if (curious) { irisR = (int)(irisR * 1.05f); pupR = (int)(pupR * 0.8f); }
 
+  int shift = zooming ? (int)(sinf(tms * 0.045f) * 72) : 0;
   int eyeCy = 104 + (int)(3.0f * breathe) + (sleeping ? 4 : 0);
   int gx = (int)gazeX, gy = (int)gazeY;
 
-  drawAntenna(tms, irisCol, scale);
+  drawAntenna(tms, irisCol, scale, shift);
 
   if (sleeping) {
-    // closed sleepy eyes: gentle curved lashes
-    drawShutEye(76, eyeCy, (int)(40 * scale));
-    drawShutEye(164, eyeCy, (int)(40 * scale));
-    if (random(10) < 2) spawnPart(1, 168, 66, 1, -2, 40);
+    drawShutEye(76 + shift, eyeCy, (int)(40 * scale));
+    drawShutEye(164 + shift, eyeCy, (int)(40 * scale));
+    if (random(12) < 2) spawnPart(1, 168 + shift, 66, 1, -2, 40);
   } else {
-    drawEyeInt(76, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
-    drawEyeInt(164, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
+    drawEyeInt(76 + shift, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
+    drawEyeInt(164 + shift, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
     if ((tama.fun < 12 || tama.hunger < 10) && random(60) == 0)
-      spawnPart(5, 76 - (int)(rx * 0.8f), eyeCy - 6, -1, 2, 30);   // tear drip
+      spawnPart(5, 76 - (int)(rx * 0.8f) + shift, eyeCy - 6, -1, 2, 30);
   }
 
-  drawMouth(tms, sleeping, happy || celebrating, sad);
+  drawMouth(tms, sleeping, happy || celebrating, sad, grumpy);
+
+  if (zooming && random(10) < 3)
+    spawnPart(2, 120 + random(-80, 81), 100 + random(-40, 41), random(-3, 4), random(-2, 2), 12);
+  if (tama.form == F_SPARKLY && random(40) == 0)
+    spawnPart(3, 120 + random(-50, 51), 60 + random(-20, 21), 0, -1, 20);
 
   if (refuseActive()) {
     cv->fillCircle(120, 52, 13, COL_SCLERA);
     cv->setFont(&FreeSansBold12pt7b);
     drawCenteredString("!", 120, 52, COL_BAD);
   }
+  if (bubble.type) drawBubble();
 }
 
-void drawAntenna(uint32_t tms, uint16_t c, float scale)
+void drawAntenna(uint32_t tms, uint16_t c, float scale, int shift)
 {
   if (tama.stage == STAGE_BABY) {
-    cv->fillCircle(120, 54, 3, c);                       // little nub
+    cv->fillCircle(120 + shift, 54, 3, c);
     return;
   }
   float sway = sinf(tms * 0.004f) * 0.35f;
-  float len = (tama.stage == STAGE_ADULT ? 20.0f : 15.0f);
-  float bx = 120, by = 58;
+  float len = (tama.form == F_ATHLETIC) ? 24.0f
+            : (tama.stage == STAGE_ADULT) ? 20.0f : 15.0f;
+  float bx = 120 + shift, by = 58;
   float tx = bx + sinf(sway) * len, ty = by - cosf(sway) * len;
   cv->drawLine(bx, by, tx, ty, COL_RIM);
   cv->drawLine(bx + 1, by, tx, ty, COL_RIM);
-  cv->fillCircle(tx, ty, 4, c);
+  cv->fillCircle(tx, ty, 4, (tama.form == F_SPARKLY) ? RGB565(255, 255, 255) : c);
   cv->fillCircle(tx - 1, ty - 1, 2, COL_SCLERA);
 }
 
@@ -972,11 +1243,10 @@ void drawShutEye(int cx, int cy, int rxw)
   }
 }
 
-void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad)
+void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy)
 {
-  if (sleeping) return;
+  if (sleeping || grumpy) return;
   if (tama.state == ST_EATING) {
-    // open mouth: dark hole with a pink tongue peeking out + crumbs
     float open = fabsf(sinf(tms * 0.022f));
     int mw = 8 + (int)(9 * open);
     cv->fillEllipse(120, 162, mw, 5, RGB565(26, 14, 20));
@@ -985,7 +1255,7 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad)
       spawnPart(2, 120 + random(-mw, mw + 1), 168, random(-2, 3), -2, 14);
     return;
   }
-  if (sad) {   // frown: corners UP, middle DOWN
+  if (sad) {
     for (float a = 35; a <= 145; a += 3) {
       float rad = a * DEG_TO_RAD;
       int x = 120 + (int)(cosf(rad) * 30);
@@ -994,7 +1264,7 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad)
     }
     return;
   }
-  if (happy) { // smile: corners DOWN, middle UP
+  if (happy) {
     for (float a = 35; a <= 145; a += 2) {
       float rad = a * DEG_TO_RAD;
       int x = 120 + (int)(cosf(rad) * 42);
@@ -1004,11 +1274,9 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad)
     }
     return;
   }
-  // neutral: tiny flat mouth
   cv->fillRoundRect(112, 160, 16, 3, 1, RGB565(90, 96, 112));
 }
 
-// integer eye rasterizer (proven fast version)
 void drawEyeInt(int cx, int cy, int rx, int ry, int gx, int gy, int irisR, int pupR,
                 uint16_t irisCol, uint16_t irisDark, bool sad)
 {
@@ -1050,7 +1318,42 @@ void drawEyeInt(int cx, int cy, int rx, int ry, int gx, int gy, int irisR, int p
       row[px] = col;
     }
   }
-  if (!sad) cv->fillCircle(cx, blushY, 4, RGB565(255, 130, 150));  // permanent blush
+  if (!sad) cv->fillCircle(cx, blushY, 4, RGB565(255, 130, 150));
+}
+
+// ------------------------ speech bubble ---------------------
+void drawBubble()
+{
+  int bx = 120, by = 26;
+  cv->fillRoundRect(bx - 19, by - 12, 38, 24, 8, COL_SCLERA);
+  cv->fillTriangle(bx - 6, by + 10, bx + 6, by + 10, bx, by + 17, COL_SCLERA);
+  switch (bubble.type) {
+    case 1: {  // burger
+      cv->fillRoundRect(bx - 8, by - 5, 16, 5, 2, RGB565(120, 80, 40));
+      cv->fillRect(bx - 8, by, 16, 2, RGB565(235, 220, 120));
+      cv->fillRoundRect(bx - 8, by + 2, 16, 4, 2, RGB565(120, 80, 40));
+      break;
+    }
+    case 2: {  // ball
+      cv->fillCircle(bx, by, 6, RGB565(90, 190, 255));
+      cv->drawLine(bx - 6, by, bx + 6, by, RGB565(230, 245, 255));
+      break;
+    }
+    case 3:  // zzz
+      cv->setFont(NULL);
+      cv->setCursor(bx - 6, by + 7);
+      cv->setTextColor(RGB565(60, 70, 95));
+      cv->print("zZ");
+      break;
+    case 4:  // question
+      cv->setFont(&FreeSansBold12pt7b);
+      drawCenteredString("?", bx, by, RGB565(40, 45, 60));
+      break;
+    case 5:  // hi
+      cv->setFont(&FreeSansBold12pt7b);
+      drawCenteredString("hi!", bx, by, RGB565(40, 45, 60));
+      break;
+  }
 }
 
 // ------------------------ particles -------------------------
@@ -1073,7 +1376,7 @@ void drawParticles()
         cv->drawCircle(p.x, p.y, (uint8_t)(24 - p.life * 2), c);
         break;
       }
-      case 5: cv->fillEllipse(p.x, p.y, 2, 3, RGB565(140, 180, 255)); break; // tear
+      case 5: cv->fillEllipse(p.x, p.y, 2, 3, RGB565(140, 180, 255)); break;
     }
   }
 }
@@ -1099,68 +1402,127 @@ void drawIcons()
   bool playing = tama.state == ST_PLAYING;
   uint16_t c = sleeping ? COL_ICONDIM : COL_ICON;
 
-  // burger
   cv->fillRoundRect(ICON[0][0] - 11, ICON[0][1] - 9, 22, 7, 3, c);
   cv->fillRect(ICON[0][0] - 11, ICON[0][1] - 1, 22, 3, c);
   cv->fillRoundRect(ICON[0][0] - 11, ICON[0][1] + 3, 22, 6, 3, c);
-  // ball
+
   cv->fillCircle(ICON[1][0], ICON[1][1] - 2, 9, playing ? COL_GOOD : c);
   cv->drawLine(ICON[1][0] - 9, ICON[1][1] - 2, ICON[1][0] + 9, ICON[1][1] - 2, COL_BG);
   cv->drawArc(ICON[1][0], ICON[1][1] - 2, 12, 9, 200, 340, c);
-  // water drop (clean)
+
   cv->fillTriangle(ICON[2][0], ICON[2][1] - 12, ICON[2][0] - 8, ICON[2][1] + 2, ICON[2][0] + 8, ICON[2][1] + 2, c);
   cv->fillCircle(ICON[2][0], ICON[2][1] + 2, 8, c);
   cv->fillCircle(ICON[2][0] - 3, ICON[2][1], 3, COL_BG);
 }
 
-// ---------------------- game overlay ------------------------
-void drawGameOverlay(uint32_t tms)
+// ---------------------- game chooser ------------------------
+void drawChooser()
 {
-  if (game.waitNext) return;
-  uint32_t el = millis() - game.roundStart;
-  float pulse = 1.0f + 0.08f * sinf(tms * 0.02f);
-  int r = (int)(17 * pulse);
-  cv->fillCircle(game.tx, game.ty, r, RGB565(90, 190, 255));
-  cv->fillCircle(game.tx - r / 3, game.ty - r / 3, r / 3, RGB565(210, 240, 255));
-  // countdown ring
-  float frac = 1.0f - (float)el / 3200.0f;
-  for (float a = -90; a < -90 + 360 * frac; a += 6) {
-    float rad = a * DEG_TO_RAD;
-    cv->fillCircle(game.tx + cosf(rad) * (r + 5), game.ty - sinf(rad) * (r + 5), 1, COL_GOOD);
+  cv->fillCircle(120, 116, 100, RGB565(8, 10, 16));
+  cv->drawCircle(120, 116, 100, COL_RIM);
+  for (int g = 0; g < 2; g++) {
+    int cx = CHOICE[g][0], cy = CHOICE[g][1];
+    cv->fillCircle(cx, cy, 28, RGB565(24, 28, 40));
+    cv->drawCircle(cx, cy, 28, COL_RIM);
+    if (g == 0) {              // pop: pulsing dot
+      cv->fillCircle(cx, cy, 10, RGB565(90, 190, 255));
+      cv->fillCircle(cx - 3, cy - 3, 4, RGB565(210, 240, 255));
+      cv->setFont(&FreeSansBold9pt7b);
+      drawCenteredString("pop", cx, cy + 40, RGB565(150, 160, 185));
+    } else {                   // catch: falling burger
+      cv->fillRoundRect(cx - 8, cy - 6, 16, 5, 2, RGB565(120, 80, 40));
+      cv->fillRect(cx - 8, cy - 1, 16, 2, RGB565(235, 220, 120));
+      cv->fillRoundRect(cx - 8, cy + 1, 16, 4, 2, RGB565(120, 80, 40));
+      cv->fillCircle(cx, cy + 14, 2, RGB565(240, 200, 120));
+      cv->setFont(&FreeSansBold9pt7b);
+      drawCenteredString("catch", cx, cy + 40, RGB565(150, 160, 185));
+    }
   }
   cv->setFont(&FreeSansBold9pt7b);
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%u/5", game.hits);
-  drawCenteredString(buf, 120, 40, RGB565(150, 160, 185));
+  drawCenteredString("pick a game", 120, 190, RGB565(130, 138, 158));
+}
+
+// ---------------------- game overlays -----------------------
+void drawGameOverlay(uint32_t tms)
+{
+  if (game.type == 0) {
+    if (game.waitNext) return;
+    uint32_t el = millis() - game.roundStart;
+    float pulse = 1.0f + 0.08f * sinf(tms * 0.02f);
+    int r = (int)(20 * pulse);
+    cv->fillCircle(game.tx, game.ty, r, RGB565(90, 190, 255));
+    cv->fillCircle(game.tx - r / 3, game.ty - r / 3, r / 3, RGB565(210, 240, 255));
+    float frac = 1.0f - (float)el / 3200.0f;
+    for (float a = -90; a < -90 + 360 * frac; a += 6) {
+      float rad = a * DEG_TO_RAD;
+      cv->fillCircle(game.tx + cosf(rad) * (r + 5), game.ty - sinf(rad) * (r + 5), 1, COL_GOOD);
+    }
+    cv->setFont(&FreeSansBold9pt7b);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u/5", game.hits);
+    drawCenteredString(buf, 120, 40, RGB565(150, 160, 185));
+  } else if (game.type == 1) {            // catch
+    for (int i = 0; i < 3; i++) {
+      if (!game.drops[i].on) continue;
+      int x = game.drops[i].x, y = game.drops[i].y;
+      cv->fillRoundRect(x - 8, y - 6, 16, 5, 2, RGB565(120, 80, 40));
+      cv->fillRect(x - 8, y - 1, 16, 2, RGB565(235, 220, 120));
+      cv->fillRoundRect(x - 8, y + 1, 16, 4, 2, RGB565(120, 80, 40));
+    }
+    cv->setFont(&FreeSansBold9pt7b);
+    char buf[8];
+    snprintf(buf, sizeof(buf), "%u/5", game.score);
+    drawCenteredString(buf, 120, 40, RGB565(150, 160, 185));
+  }
 }
 
 // ---------------------- info overlay ------------------------
 void drawInfo()
 {
-  cv->fillCircle(120, 116, 96, RGB565(8, 10, 16));
-  cv->drawCircle(120, 116, 96, COL_RIM);
-  cv->drawCircle(120, 116, 94, RGB565(18, 21, 30));
+  // bright panel - impossible to miss
+  cv->fillCircle(120, 116, 98, RGB565(30, 34, 48));
+  cv->drawCircle(120, 116, 98, RGB565(90, 110, 150));
+  cv->fillCircle(120, 116, 93, RGB565(22, 25, 36));
+  cv->fillRoundRect(120 - 88, 16, 176, 16, 6, RGB565(60, 80, 120));
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString("PET STATS", 120, 24, RGB565(230, 238, 250));
 
-  char line[40];
+  char line[48];
   cv->setFont(&FreeSansBold12pt7b);
-  snprintf(line, sizeof(line), "%s", STAGE_NAME[tama.stage]);
-  drawCenteredString(line, 120, 52, COL_ICON);
+  if (tama.form != F_BALANCED)
+    snprintf(line, sizeof(line), "%s %s", STAGE_NAME[tama.stage], FORM_NAME[tama.form]);
+  else
+    snprintf(line, sizeof(line), "%s", STAGE_NAME[tama.stage]);
+  drawCenteredString(line, 120, 46, RGB565(240, 244, 252));
+
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString(P_NAME[tama.pers], 120, 68, RGB565(170, 180, 200));
+
+  bar(88, "FULL", tama.hunger, COL_GOOD, COL_BAD);
+  bar(114, "FUN ", tama.fun, COL_HEART, RGB565(120, 120, 140));
+  bar(140, "Zzz ", tama.energy, RGB565(90, 190, 255), COL_BAD);
 
   cv->setFont(&FreeSansBold9pt7b);
   uint32_t mins = tama.ageSec / 60;
   if (mins < 90) snprintf(line, sizeof(line), "age %umin", (unsigned)mins);
   else snprintf(line, sizeof(line), "age %uh%02um", (unsigned)(mins / 60), (unsigned)(mins % 60));
-  drawCenteredString(line, 120, 76, RGB565(130, 138, 158));
+  drawCenteredString(line, 120, 166, RGB565(180, 188, 205));
 
-  bar(52, "FULL", tama.hunger, COL_GOOD, COL_BAD);
-  bar(84, "FUN ", tama.fun, COL_HEART, RGB565(120, 120, 140));
-  bar(116, "Zzz ", tama.energy, RGB565(90, 190, 255), COL_BAD);
-
-  int np = 0;
-  for (auto &p : poops) np += p.active;
-  snprintf(line, sizeof(line), np ? "%d mess%s to clean" : "all tidy!", np, np == 1 ? "" : "es");
-  drawCenteredString(line, 120, 148, np ? RGB565(210, 160, 90) : RGB565(120, 200, 150));
-  drawCenteredString("tap to close", 120, 172, RGB565(90, 96, 112));
+  if (timeSynced) {
+    const char *DOW[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+    snprintf(line, sizeof(line), "%02d:%02d  %s %d/%02d",
+             curHour, curMin, DOW[curDow], curDay, curMon);
+    drawCenteredString(line, 120, 182, RGB565(150, 200, 160));
+  } else {
+    drawCenteredString("OFFLINE (no wifi)", 120, 182, RGB565(150, 158, 175));
+  }
+  if (batteryPct >= 0) {
+    snprintf(line, sizeof(line), "BAT %d%%", (int)batteryPct);
+  } else {
+    snprintf(line, sizeof(line), "USB power");
+  }
+  drawCenteredString(line, 120, 198, RGB565(180, 188, 205));
+  drawCenteredString("tap to close", 120, 212, RGB565(140, 148, 165));
 }
 
 void bar(int y, const char *label, float v, uint16_t hi, uint16_t lo)
@@ -1174,19 +1536,62 @@ void bar(int y, const char *label, float v, uint16_t hi, uint16_t lo)
   if (w > 0) cv->fillRoundRect(88, y - 2, w, 8, 4, lerpColor(lo, hi, (uint8_t)(v * 2.55f)));
 }
 
+// ---------------------- night clock -------------------------
+void drawNightClock()
+{
+  if (curHour < 0) return;
+  cv->drawCircle(120, 120, 116, RGB565(20, 22, 30));
+  cv->drawCircle(120, 120, 114, RGB565(14, 15, 20));
+  for (int i = 0; i < 60; i++) {
+    float rad = i * 6 * DEG_TO_RAD;
+    float ca = cosf(rad), sa = sinf(rad);
+    bool major = (i % 5 == 0);
+    int rOut = major ? 106 : 109;
+    uint16_t c = major ? RGB565(120, 128, 148) : RGB565(50, 55, 70);
+    cv->drawLine(120 + ca * 101, 120 + sa * 101, 120 + ca * rOut, 120 + sa * rOut, c);
+    if (major) cv->drawLine(120 + ca * 102, 120 + sa * 102, 120 + ca * rOut, 120 + sa * rOut, c);
+  }
+  float sec = curSec + (millis() % 1000) / 1000.0f;
+  float minv = curMin + sec / 60.0f;
+  float hrsv = (curHour % 12) + minv / 60.0f;
+  clockHand(hrsv * 30 * DEG_TO_RAD, 50, 4, RGB565(150, 158, 178));
+  clockHand(minv * 6 * DEG_TO_RAD, 78, 3, RGB565(120, 128, 148));
+  float srad = sec * 6 * DEG_TO_RAD;
+  float cs = cosf(srad), ss = sinf(srad);
+  cv->drawLine(120 - cs * 16, 120 - ss * 16, 120 + cs * 90, 120 + ss * 90, RGB565(150, 60, 70));
+  cv->fillCircle(120, 120, 5, RGB565(150, 60, 70));
+  cv->fillCircle(120, 120, 2, RGB565(200, 205, 220));
+  const char *DOW[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+  char line[24];
+  snprintf(line, sizeof(line), "%s %d", DOW[curDow], curDay);
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString(line, 120, 176, RGB565(70, 76, 94));
+}
+
+void clockHand(float rad, float len, float wid, uint16_t color)
+{
+  float ca = cosf(rad), sa = sinf(rad);
+  float x0 = 120 - ca * 10, y0 = 120 - sa * 10;
+  float x1 = 120 + ca * len, y1 = 120 + sa * len;
+  cv->drawLine(x0, y0, x1, y1, color);
+  float dx = x1 - x0, dy = y1 - y0;
+  float l = sqrtf(dx * dx + dy * dy);
+  if (l < 1) return;
+  float ox = -dy / l * wid * 0.5f, oy = dx / l * wid * 0.5f;
+  cv->drawLine(x0 + ox, y0 + oy, x1 + ox, y1 + oy, color);
+  cv->drawLine(x0 - ox, y0 - oy, x1 - ox, y1 - oy, color);
+}
+
 // ---------------------- egg intro ---------------------------
 void drawEggIntro(uint32_t tms)
 {
   uint32_t el = tms - bootAt;
   cv->fillCircle(120, 116, 96, RGB565(8, 10, 16));
-  float wob = sinf(el * 0.012f) * 0.12f;
   int ex = 120 + (int)(sinf(el * 0.012f) * 6);
   cv->fillEllipse(ex, 118, 34, 44, RGB565(225, 228, 238));
   cv->fillEllipse(ex - 8, 104, 10, 14, RGB565(245, 246, 252));
-  // cracks appear progressively
   if (el > 900)  cv->drawLine(ex - 14, 106, ex - 4, 114, RGB565(90, 96, 112));
   if (el > 1500) { cv->drawLine(ex - 4, 114, ex + 6, 108, RGB565(90, 96, 112)); cv->drawLine(ex + 6, 108, ex + 2, 124, RGB565(90, 96, 112)); }
-  (void)wob;
   cv->setFont(&FreeSansBold9pt7b);
   drawCenteredString(el > 1500 ? "almost..." : "something is moving", 120, 186, RGB565(130, 138, 158));
   if (el > 2100) {
@@ -1197,8 +1602,27 @@ void drawEggIntro(uint32_t tms)
     happyUntil = millis() + 1500;
     for (int i = 0; i < 12; i++)
       spawnPart(3, 120 + random(-70, 71), 110 + random(-60, 61), 0, -2, 30);
-    dbg("[TAMA] hatched!\n");
+    dbg("[TAMA] hatched as %s!\n", P_NAME[tama.pers]);
   }
+}
+
+// ---------------------- orientation test --------------------
+void drawOrientationTest()
+{
+  uint16_t *fb = cv->getFramebuffer();
+  for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = RGB565(10, 10, 14);
+
+  cv->setFont(&FreeSansBold12pt7b);
+  drawCenteredString("TOP", 120, 22, RGB565(255, 255, 255));
+  drawCenteredString("BOTTOM", 120, 218, RGB565(255, 255, 255));
+  cv->setFont(&FreeSansBold18pt7b);
+  drawCenteredString("L", 24, 120, RGB565(120, 200, 255));
+  drawCenteredString("R", 216, 120, RGB565(120, 200, 255));
+  int cx = 120, cy = 116;
+  cv->fillTriangle(cx, cy - 22, cx - 14, cy + 2, cx + 14, cy + 2, RGB565(255, 200, 60));
+  cv->fillRect(cx - 3, cy + 2, 6, 18, RGB565(255, 200, 60));
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString("tap to continue", 120, 176, RGB565(140, 150, 170));
 }
 
 // ------------------------ text helper -----------------------
@@ -1210,3 +1634,5 @@ void drawCenteredString(const char *s, int cx, int cy, uint16_t color)
   cv->setTextColor(color);
   cv->print(s);
 }
+
+bool refuseActive() { return (int32_t)(refuseUntil - millis()) > 0; }

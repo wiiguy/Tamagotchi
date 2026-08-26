@@ -8,22 +8,36 @@ No buttons, no wires, no cloud — everything happens on the round glass.
 
 ## What it does
 
-The Orb hatches from an egg, then lives on your desk:
+The Orb hatches from an egg with a **personality** (lazy / hyper / picky /
+cuddly — affects how fast it gets hungry/bored/tired and how much petting
+helps), then lives on your desk:
 
 | Interaction | What happens |
 |---|---|
 | **Drag** your finger over it | Petting — hearts float up, +fun |
 | **Tap** it | It giggles, +a little fun |
-| **Burger icon** (bottom-left) | Feed it — chomping animation, +fullness |
-| **Ball icon** (bottom-middle) | Bubble-pop mini-game (5 rounds) — +fun, −energy |
+| **Burger icon** (bottom-left) | Feed it — chomping mouth + crumbs, +fullness |
+| **Ball icon** (bottom-middle) | Game chooser: **pop** the bubble or **catch** falling burgers |
 | **Drop icon** (bottom-right) | Clean up all poops |
 | **Tap a poop** directly | Clean just that one |
-| **Hold your finger ~1s** | Stats & age overlay |
+| **Hold finger ~1s / double-tap / tap top strip** | Stats & age panel (personality, form, time, battery) |
+| **Swipe left / right** | Quick feed / quick clean |
 
 It gets hungry/bored/tired on its own, poops after meals (and gets sadder
 while poops are around), **falls asleep and dims the screen** when exhausted
-(tap to wake), **evolves** `BABY → TEEN → ADULT` with age, and can get
-visibly miserable (droopy lids, frown, tears) if you neglect it.
+(tap to wake), evolves `BABY → TEEN → ADULT` with a care-based **form**
+(CHUBBY / ATHLETIC / SPARKLY), and with optional WiFi/NTP it **sleeps at
+night** and shows a round analog clock while asleep. It also gets the
+**zoomies** when full of fun+energy, gets curious if you ignore it, and
+complains in speech bubbles when neglected. A battery % arc activates once
+`BATTERY_PIN` is set (boot log probes GPIO0/1 for the divider).
+
+## WiFi & day/night
+
+Set `WIFI_SSID` / `WIFI_PASS` (and `TZ_RULE` if needed) in `orb.ino` to
+enable NTP. With time synced the pet sleeps 22:00–07:00 (ambient clock face)
+and the stats panel shows the real time. Without WiFi it falls back to
+energy-based naps only.
 
 The three colored arcs around the bezel are its vitals:
 left = **fullness** (green→red), top-right = **fun** (pink), bottom = **energy** (blue).
