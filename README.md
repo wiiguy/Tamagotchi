@@ -16,13 +16,13 @@ helps), then lives on your desk:
 | Interaction | What happens |
 |---|---|
 | **Drag** your finger over it | Petting — hearts float up, +fun |
-| **Tap** it | It giggles, +a little fun |
-| **Burger icon** (bottom-left) | Feed it — chomping mouth + crumbs, +fullness |
+| **Tap** it | It giggles / waves, +a little fun |
+| **Burger icon** (bottom-left) | Food chooser: **burger / apple / cake / fish / candy** (each has different hunger+fun) |
 | **Ball icon** (bottom-middle) | Game chooser: **pop** the bubble or **catch** falling burgers |
 | **Drop icon** (bottom-right) | Clean up all poops |
 | **Tap a poop** directly | Clean just that one |
 | **Drag over poop** | Clean poop while petting |
-| **Hold finger ~1s / double-tap** | Stats & age panel (personality, form, time, battery) |
+| **Double-tap** | Stats & age panel (personality, form, favorite food, accessory, time, battery) |
 | **Swipe left / right** | Quick feed / quick clean |
 
 It gets hungry/bored/tired on its own, poops after meals (and gets sadder
@@ -33,6 +33,45 @@ night** and shows a round analog clock while asleep. It also gets the
 **zoomies** when full of fun+energy, gets curious if you ignore it, and
 complains in speech bubbles when neglected. A battery % arc activates once
 `BATTERY_PIN` is set (boot log probes GPIO0/1 for the divider).
+
+### Food types
+
+| Food | Hunger | Fun | Description |
+|---|---|---|---|
+| Burger | +24 | +0 | Basic meal, filling |
+| Apple | +16 | +4 | Light snack, small fun boost |
+| Cake | +20 | +8 | Treat, moderate fun |
+| Fish | +28 | +2 | High protein, very filling |
+| Candy | +10 | +14 | Junk food, big fun boost |
+
+The pet tracks which food you feed it most — its **favorite food** shows in
+the stats panel. Each meal has a 5% chance to earn a random **accessory**.
+
+### Moods
+
+- **Happy** — bouncing animation, big smile (fed, petted, or played with)
+- **Excited** — all stats above 75, ultra-bouncy with sparkle particles
+- **Sleepy** — energy below 25, slow drooping eyes, occasional yawn
+- **Shy** — rare reaction when touched after being alone, small wobbly mouth
+- **Curious** — eyes widen when ignored for 20+ seconds
+- **Zoomies** — full fun+energy, eyes dart side to side
+- **Grumpy** — averted gaze after being woken from sleep
+- **Angry** — fun at 0, red eyes, V-frown, refuses food/games
+- **Sad** — low hunger/fun/energy, droopy eyes
+
+### Accessories
+
+Earned randomly (5% chance per meal fed). Shown on the pet's head:
+- **Hat** (red) — classic party hat
+- **Glasses** (blue) — round frames
+- **Bow** (pink) — cute hair bow
+- **Crown** (gold) — three-point crown
+
+### Idle animations
+
+- **Stretch** — after waking up, body elongates
+- **Wave** — tapping the pet makes it sway side to side
+- **Yawn** — when getting sleepy, big O mouth
 
 ### Death & anger
 
@@ -59,8 +98,8 @@ left = **fullness** (green→red), top-right = **fun** (pink), bottom = **energy
 ## State & persistence
 
 Everything is saved to the board's flash (NVS) every ~20s: stats, age,
-hatched flag, poops. It survives power-off **and re-flashing** — your pet
-is still yours after a firmware update.
+hatched flag, poops, accessory, and food memory. It survives power-off
+**and re-flashing** — your pet is still yours after a firmware update.
 
 ## Time scale
 

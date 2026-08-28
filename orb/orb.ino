@@ -315,6 +315,22 @@ enum PetState : uint8_t { ST_AWAKE = 0, ST_EATING, ST_PLAYING, ST_SLEEPING, ST_D
 enum Stage : uint8_t { STAGE_BABY = 0, STAGE_TEEN, STAGE_ADULT };
 const char *STAGE_NAME[] = { "BABY", "TEEN", "ADULT" };
 
+// food types: burger, apple, cake, fish, candy
+enum FoodType : uint8_t { FD_BURGER = 0, FD_APPLE, FD_CAKE, FD_FISH, FD_CANDY, FD_COUNT };
+const char *FD_NAME[FD_COUNT] = { "burger", "apple", "cake", "fish", "candy" };
+const float FD_HUNGER[FD_COUNT] = { 24.0f, 16.0f, 20.0f, 28.0f, 10.0f };
+const float FD_FUN[FD_COUNT]    = {  0.0f,  4.0f,  8.0f,  2.0f, 14.0f };
+const uint16_t FD_COL[FD_COUNT] = { RGB565(180,120,60), RGB565(200,60,60),
+                                    RGB565(230,180,220), RGB565(100,160,220),
+                                    RGB565(220,180,255) };
+const int16_t FOOD_CHOICE[FD_COUNT][2] = { {30,118},{78,118},{126,118},{174,118},{222,118} };
+
+// accessory types
+enum Accessory : uint8_t { ACC_NONE = 0, ACC_HAT, ACC_GLASSES, ACC_BOW, ACC_CROWN, ACC_COUNT };
+const char *ACC_NAME[ACC_COUNT] = { "none", "hat", "glasses", "bow", "crown" };
+const uint16_t ACC_COL[ACC_COUNT] = { 0, RGB565(200,60,60), RGB565(60,60,200),
+                                      RGB565(230,120,200), RGB565(240,200,60) };
+
 struct TamaData {
   float hunger = 80, fun = 80, energy = 80;
   uint32_t ageSec = 0;
@@ -324,6 +340,11 @@ struct TamaData {
   Form form = F_BALANCED;
   Personality pers = P_LAZY;
   uint16_t fedCount = 0, playCount = 0, petCount = 0;   // care history
+  uint8_t accessory = ACC_NONE;       // worn accessory
+  uint8_t lastFood = FD_BURGER;       // last food fed (for memory)
+  uint8_t favFood = FD_BURGER;        // favorite food (most fed)
+  uint8_t favFoodCount = 0;           // times fav food was fed
+  uint8_t foodCount[FD_COUNT] = {};   // feed count per type
 } tama;
 
 // ------------------------ poops -----------------------------
@@ -343,7 +364,6 @@ bool virginBoot = false;
 void saveTamagotchi()
 {
   prefs.begin("tama", false);
-  // batch all writes before end() to minimize NVS overhead
   prefs.putBool("hatched", tama.hatched);
   prefs.putUChar("hunger", (uint8_t)tama.hunger);
   prefs.putUChar("fun", (uint8_t)tama.fun);
@@ -358,6 +378,14 @@ void saveTamagotchi()
   uint8_t pmask = 0;
   for (int i = 0; i < 4; i++) if (poopsActive(i)) pmask |= (1 << i);
   prefs.putUChar("poops", pmask);
+  prefs.putUChar("acc", tama.accessory);
+  prefs.putUChar("lastF", tama.lastFood);
+  prefs.putUChar("favF", tama.favFood);
+  prefs.putUChar("favFC", tama.favFoodCount);
+  for (int i = 0; i < FD_COUNT; i++) {
+    char key[6]; snprintf(key, sizeof(key), "fc%u", i);
+    prefs.putUChar(key, tama.foodCount[i]);
+  }
   prefs.end();
   statsDirty = false;
   lastSaveAt = millis();
@@ -380,6 +408,14 @@ void loadTamagotchi()
   tama.petCount = prefs.getUShort("pet", 0);
   uint8_t pmask = prefs.getUChar("poops", 0);
   bool wasDead = prefs.getBool("dead", false);
+  if (prefs.isKey("acc")) tama.accessory = prefs.getUChar("acc", ACC_NONE);
+  if (prefs.isKey("lastF")) tama.lastFood = prefs.getUChar("lastF", FD_BURGER);
+  if (prefs.isKey("favF")) tama.favFood = prefs.getUChar("favF", FD_BURGER);
+  if (prefs.isKey("favFC")) tama.favFoodCount = prefs.getUChar("favFC", 0);
+  for (int i = 0; i < FD_COUNT; i++) {
+    char key[6]; snprintf(key, sizeof(key), "fc%u", i);
+    if (prefs.isKey(key)) tama.foodCount[i] = prefs.getUChar(key, 0);
+  }
   prefs.end();
   for (int i = 0; i < 4; i++) poopSet(i, (pmask & (1 << i)) != 0);
   tama.stage = tama.ageSec < 3600UL ? STAGE_BABY
@@ -428,6 +464,10 @@ struct Game {
 bool chooserOpen = false;
 const int16_t CHOICE[2][2] = { {70,118}, {170,118} };
 
+// food chooser
+bool foodChooserOpen = false;
+uint8_t selectedFood = 0;
+
 // ---------------------- mood / anim state -------------------
 float blinkPhase = 1.0f;
 bool blinking = false;
@@ -441,6 +481,12 @@ uint32_t grumpyUntil = 0;
 uint32_t curiousUntil = 0;
 uint32_t zoomUntil = 0, nextZoom = 0;
 uint32_t angryUntil = 0;
+uint32_t excitedUntil = 0;       // excited mood: high stats
+uint32_t sleepyUntil = 0;        // sleepy mood: low energy
+uint32_t shyUntil = 0;           // shy mood: rare idle
+uint32_t stretchUntil = 0;       // stretch animation after waking
+uint32_t waveUntil = 0;          // wave animation
+uint32_t yawnUntil = 0;          // yawn animation
 struct BubbleState { uint8_t type = 0; uint32_t until = 0; } bubble;
 uint32_t lastBubble = 0;
 uint32_t stateEnd = 0;
@@ -591,8 +637,7 @@ void loop()
 
   if (nowMs - lastTick >= 250) {
     lastTick = nowMs;
-    uint32_t tSim = micros();
-    simTick();
+    if (!virginBoot) simTick();
     uint32_t dSim = micros() - tSim;
     if (dSim > 50000) dbg("[PERF] simTick %lums\n", (unsigned long)(dSim / 1000));
   }
@@ -623,13 +668,19 @@ void loop()
 
   if (tama.state == ST_EATING && (int32_t)(stateEnd - nowMs) < 0) {
     tama.state = ST_AWAKE;
-    tama.hunger += 24;
+    uint8_t ft = tama.lastFood;
+    tama.hunger += FD_HUNGER[ft];
     if (tama.hunger > 100) tama.hunger = 100;
+    tama.fun += FD_FUN[ft];
+    if (tama.fun > 100) tama.fun = 100;
     pendingMealPoop++;
     tama.fedCount++;
     happyUntil = nowMs + 1000;
+    // accessory drop: 5% chance on each meal
+    if (tama.accessory == ACC_NONE && random(100) < 5)
+      tama.accessory = 1 + random(ACC_COUNT - 1);
     statsDirty = true;
-    dbg("[TAMA] fed h=%u\n", (uint8_t)tama.hunger);
+    dbg("[TAMA] fed %s h=%u f=%u\n", FD_NAME[ft], (uint8_t)tama.hunger, (uint8_t)tama.fun);
   }
   if (tama.state == ST_PLAYING && game.active) tickGame();
 
@@ -842,9 +893,23 @@ void headShake() { refuseUntil = millis() + 800; }
 
 void startFeeding()
 {
-  if (tama.state != ST_AWAKE || chooserOpen) return;
+  if (tama.state != ST_AWAKE || chooserOpen || foodChooserOpen) return;
   if (tama.hunger > 92 || (int32_t)(millis() - angryUntil) < 0) { headShake(); return; }
+  foodChooserOpen = true;
+  selectedFood = 0;
+}
+
+void feedPet(uint8_t foodType)
+{
+  if (tama.state != ST_AWAKE || foodType >= FD_COUNT) return;
   tama.state = ST_EATING;
+  tama.lastFood = foodType;
+  tama.foodCount[foodType]++;
+  // update favorite food
+  if (tama.foodCount[foodType] > tama.favFoodCount) {
+    tama.favFoodCount = tama.foodCount[foodType];
+    tama.favFood = foodType;
+  }
   eatStart = millis();
   stateEnd = eatStart + 1900;
 }
@@ -937,6 +1002,18 @@ void handleTap(uint16_t x, uint16_t y)
     return;
   }
 
+  if (foodChooserOpen) {           // picking a food
+    for (int f = 0; f < FD_COUNT; f++) {
+      if (hitPt(x, y, FOOD_CHOICE[f][0], FOOD_CHOICE[f][1], 26)) {
+        foodChooserOpen = false;
+        feedPet(f);
+        return;
+      }
+    }
+    foodChooserOpen = false;       // tap elsewhere cancels
+    return;
+  }
+
   if (tama.state == ST_PLAYING) { if (game.active) handleTapGame(x, y); return; }
 
   if (tama.state == ST_SLEEPING) {
@@ -992,6 +1069,8 @@ void handleTap(uint16_t x, uint16_t y)
     happyUntil = millis() + 1000;
     tama.fun += 2;
     if (tama.fun > 100) tama.fun = 100;
+    waveUntil = millis() + 800;     // wave animation
+    if (random(100) < 8) shyUntil = millis() + 2000;  // rare shy reaction
     statsDirty = true;
   }
 }
@@ -1175,6 +1254,31 @@ void updateLook(uint32_t tms)
     curiousUntil = tms + 1600;
   }
 
+  // excited mood: all stats above 75
+  if (tama.state == ST_AWAKE && tama.hunger > 75 && tama.fun > 75 && tama.energy > 75 &&
+      !zooming && (int32_t)(millis() - angryUntil) > 0 && (int32_t)(excitedUntil - tms) <= 0) {
+    if (random(100) < 5) excitedUntil = tms + 3000;
+  }
+
+  // sleepy mood: energy < 25 but not yet sleeping
+  if (tama.state == ST_AWAKE && tama.energy < 25 &&
+      (int32_t)(sleepyUntil - tms) <= 0) {
+    sleepyUntil = tms + 4000;
+    if (random(100) < 30) yawnUntil = tms + 1200;
+  }
+
+  // shy mood: rare random idle
+  if (tama.state == ST_AWAKE && !zooming && !playing &&
+      (int32_t)(tms - lastTouchAt) > 5000 && (int32_t)(shyUntil - tms) <= 0) {
+    if (random(2000) < 1) shyUntil = tms + 3000;
+  }
+
+  // stretch animation: after waking up
+  if (tama.state == ST_AWAKE && stretchUntil == 0 &&
+      (int32_t)(tms - wakeGraceAt) < 200 && (int32_t)(tms - wakeGraceAt) > 50) {
+    stretchUntil = tms + 1500;
+  }
+
   // speech bubbles (need-based, rate-limited)
   if (bubble.until < tms && tama.state == ST_AWAKE && !night &&
       (int32_t)(tms - lastBubble) > 30000) {
@@ -1236,6 +1340,7 @@ void renderScene(uint32_t tms)
   drawParticles();
   drawIcons();
   if (chooserOpen) drawChooser();
+  if (foodChooserOpen) drawFoodChooser();
   if (infoOverlay) drawInfo();
   if (game.active) drawGameOverlay(tms);
 }
@@ -1314,7 +1419,13 @@ void drawPet(uint32_t tms)
   bool zooming = (int32_t)(zoomUntil - tms) > 0;
   bool sleeping = tama.state == ST_SLEEPING;
   bool angry = (int32_t)(millis() - angryUntil) < 0;
-  bool sad = !sleeping && !happy && !grumpy && !zooming && !angry &&
+  bool excited = (int32_t)(excitedUntil - tms) > 0;
+  bool sleepy = (int32_t)(sleepyUntil - tms) > 0;
+  bool shy = (int32_t)(shyUntil - tms) > 0;
+  bool stretching = (int32_t)(stretchUntil - tms) > 0;
+  bool waving = (int32_t)(waveUntil - tms) > 0;
+  bool yawning = (int32_t)(yawnUntil - tms) > 0;
+  bool sad = !sleeping && !happy && !grumpy && !zooming && !angry && !excited && !sleepy &&
              (tama.hunger < 25 || tama.fun < 20 || tama.energy < 15);
 
   // angry overrides iris to red
@@ -1327,9 +1438,12 @@ void drawPet(uint32_t tms)
   if (sleeping) squash = 0.12f;
   else if (happy || celebrating) squash = 0.62f + 0.06f * sinf(tms * 0.02f);
   else if (angry) squash = 0.92f + 0.03f * sinf(tms * 0.03f);  // vibrating with rage
+  else if (excited) squash = 0.58f + 0.10f * sinf(tms * 0.03f); // bouncy excited
+  else if (sleepy) squash = 0.88f + 0.04f * sinf(tms * 0.005f); // slow droop
   else if (sad) squash = 0.82f;
 
   float droop = sad ? 0.88f : 1.0f;
+  if (stretching) droop = 0.70f + 0.30f * sinf((float)(tms % 1500) * PI / 1500.0f); // stretch up
   int ry = (int)((42.0f * squash * droop) * scale *
                  (sleeping ? 1.0f : (1.0f - 0.96f * (1.0f - blinkPhase))));
   int rx = (int)(44.0f * scale * (1.0f + 0.02f * breathe));
@@ -1338,23 +1452,33 @@ void drawPet(uint32_t tms)
   if (curious) { irisR = (int)(irisR * 1.05f); pupR = (int)(pupR * 0.8f); }
 
   int shift = zooming ? (int)(sinf(tms * 0.045f) * 72) : 0;
+  if (waving) shift += (int)(sinf(tms * 0.012f) * 8);  // gentle wave sway
   int eyeCy = 104 + (int)(3.0f * breathe) + (sleeping ? 4 : 0);
   int gx = (int)gazeX, gy = (int)gazeY;
 
   drawAntenna(tms, irisCol, scale, shift);
+
+  // draw accessory on top of pet
+  if (tama.accessory != ACC_NONE) drawAccessory(tms, shift, scale);
 
   if (sleeping) {
     drawShutEye(76 + shift, eyeCy, (int)(40 * scale));
     drawShutEye(164 + shift, eyeCy, (int)(40 * scale));
     if (random(12) < 2) spawnPart(1, 168 + shift, 66, 1, -2, 40);
   } else {
+    // shy: squint eyes
+    if (shy) ry = ry / 2;
     drawEyeInt(76 + shift, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
     drawEyeInt(164 + shift, eyeCy, rx, ry, gx, gy, irisR, pupR, irisCol, irisDark, sad);
+    // excited: sparkle particles
+    if (excited && random(8) == 0)
+      spawnPart(3, 76 + shift + random(-10, 11), eyeCy - 10, 0, -1, 16);
     if ((tama.fun < 12 || tama.hunger < 10) && random(60) == 0)
       spawnPart(5, 76 - (int)(rx * 0.8f) + shift, eyeCy - 6, -1, 2, 30);
   }
 
-  drawMouth(tms, sleeping, happy || celebrating, sad, grumpy, angry);
+  drawMouth(tms, sleeping, happy || celebrating, sad, grumpy, angry,
+            excited, sleepy, shy, yawning, waving);
 
   if (zooming && random(10) < 3)
     spawnPart(2, 120 + random(-80, 81), 100 + random(-40, 41), random(-3, 4), random(-2, 2), 12);
@@ -1408,9 +1532,17 @@ void drawShutEye(int cx, int cy, int rxw)
   }
 }
 
-void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy, bool angry)
+void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy, bool angry,
+               bool excited, bool sleepy, bool shy, bool yawning, bool waving)
 {
   if (sleeping || grumpy) return;
+  if (yawning) {
+    // big O mouth
+    int open = (int)(12.0f * sinf((float)(tms % 1200) * PI / 1200.0f));
+    cv->fillEllipse(120, 166, 8 + open, 6 + open, RGB565(26, 14, 20));
+    cv->fillEllipse(120, 167, 4 + open / 2, 3 + open / 2, RGB565(200, 100, 120));
+    return;
+  }
   if (tama.state == ST_EATING) {
     float open = fastFabs(sinf(tms * 0.022f));
     int mw = 8 + (int)(9 * open);
@@ -1421,13 +1553,11 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy, b
     return;
   }
   if (angry) {
-    // sharp V-frown
     for (int i = 0; i <= 12; i++) {
       int x = 108 + i * 2;
       int y = 178 + (i < 6 ? i * 2 : (12 - i) * 2);
       cv->fillCircle(x, y, 2, RGB565(200, 60, 60));
     }
-    // steam puffs
     if (random(100) < 8) {
       spawnPart(3, 80 + random(80), 70 + random(10), random(-1, 2), -2, 18);
     }
@@ -1442,6 +1572,30 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy, b
     }
     return;
   }
+  if (excited) {
+    // big open smile with teeth
+    for (int a = 35; a <= 145; a += 2) {
+      int16_t cs = fastCos10(a), sn = fastSin10(a);
+      int x = 120 + ((int32_t)48 * cs >> SIN_LUT_SHIFT);
+      int y = 128 + ((int32_t)48 * sn >> SIN_LUT_SHIFT);
+      if (y > 210) continue;
+      cv->fillCircle(x, y, 5, RGB565(255, 255, 255));
+    }
+    for (int a = 45; a <= 135; a += 3) {
+      int16_t cs = fastCos10(a), sn = fastSin10(a);
+      int x = 120 + ((int32_t)38 * cs >> SIN_LUT_SHIFT);
+      int y = 132 + ((int32_t)38 * sn >> SIN_LUT_SHIFT);
+      if (y > 205) continue;
+      cv->fillCircle(x, y, 3, RGB565(235, 240, 248));
+    }
+    return;
+  }
+  if (shy) {
+    // small wobbly mouth
+    int wx = 120 + (int)(sinf(tms * 0.01f) * 2);
+    cv->fillRoundRect(wx - 6, 162, 12, 3, 1, RGB565(180, 120, 140));
+    return;
+  }
   if (happy) {
     for (int a = 35; a <= 145; a += 2) {
       int16_t cs = fastCos10(a), sn = fastSin10(a);
@@ -1453,6 +1607,85 @@ void drawMouth(uint32_t tms, bool sleeping, bool happy, bool sad, bool grumpy, b
     return;
   }
   cv->fillRoundRect(112, 160, 16, 3, 1, RGB565(90, 96, 112));
+}
+
+void drawAccessory(uint32_t tms, int shift, float scale)
+{
+  int topY = 56;
+  switch (tama.accessory) {
+    case ACC_HAT:
+      cv->fillEllipse(120 + shift, topY - 14, 22, 10, ACC_COL[ACC_HAT]);
+      cv->fillRoundRect(112 + shift, topY - 18, 16, 8, 3, ACC_COL[ACC_HAT]);
+      break;
+    case ACC_GLASSES:
+      cv->drawCircle(80 + shift, 104, 12, ACC_COL[ACC_GLASSES]);
+      cv->drawCircle(160 + shift, 104, 12, ACC_COL[ACC_GLASSES]);
+      cv->drawLine(92 + shift, 104, 148 + shift, 104, ACC_COL[ACC_GLASSES]);
+      cv->drawLine(68 + shift, 104, 60 + shift, 100, ACC_COL[ACC_GLASSES]);
+      cv->drawLine(172 + shift, 104, 180 + shift, 100, ACC_COL[ACC_GLASSES]);
+      break;
+    case ACC_BOW:
+      cv->fillTriangle(120 + shift, topY - 6, 104 + shift, topY - 16, 104 + shift, topY + 4, ACC_COL[ACC_BOW]);
+      cv->fillTriangle(120 + shift, topY - 6, 136 + shift, topY - 16, 136 + shift, topY + 4, ACC_COL[ACC_BOW]);
+      cv->fillCircle(120 + shift, topY - 6, 3, RGB565(255, 200, 230));
+      break;
+    case ACC_CROWN: {
+      uint16_t c = ACC_COL[ACC_CROWN];
+      cv->fillRoundRect(104 + shift, topY - 20, 32, 10, 2, c);
+      cv->fillTriangle(108 + shift, topY - 20, 112 + shift, topY - 30, 116 + shift, topY - 20, c);
+      cv->fillTriangle(120 + shift, topY - 20, 120 + shift, topY - 34, 120 + shift, topY - 20, c);
+      cv->fillTriangle(124 + shift, topY - 20, 128 + shift, topY - 30, 132 + shift, topY - 20, c);
+      break;
+    }
+    default: break;
+  }
+}
+
+void drawFoodChooser()
+{
+  cv->fillCircle(120, 116, 100, RGB565(8, 10, 16));
+  cv->drawCircle(120, 116, 100, COL_RIM);
+  for (int f = 0; f < FD_COUNT; f++) {
+    int cx = FOOD_CHOICE[f][0], cy = FOOD_CHOICE[f][1];
+    cv->fillCircle(cx, cy, 20, RGB565(24, 28, 40));
+    cv->drawCircle(cx, cy, 20, COL_RIM);
+    // draw food icon
+    switch (f) {
+      case FD_BURGER: // burger
+        cv->fillRoundRect(cx - 10, cy - 6, 20, 4, 2, RGB565(180, 120, 60));
+        cv->fillRect(cx - 10, cy - 2, 20, 2, RGB565(100, 180, 60));
+        cv->fillRoundRect(cx - 10, cy, 20, 3, 2, RGB565(180, 120, 60));
+        cv->fillRoundRect(cx - 10, cy + 3, 20, 4, 2, RGB565(200, 150, 80));
+        break;
+      case FD_APPLE: // apple
+        cv->fillCircle(cx, cy + 2, 10, RGB565(200, 60, 60));
+        cv->fillCircle(cx - 3, cy - 1, 10, RGB565(180, 40, 40));
+        cv->fillRect(cx - 1, cy - 12, 2, 6, RGB565(100, 70, 30));
+        cv->fillCircle(cx + 3, cy - 10, 3, RGB565(80, 160, 60));
+        break;
+      case FD_CAKE: // cake
+        cv->fillRoundRect(cx - 10, cy - 2, 20, 10, 3, RGB565(230, 180, 220));
+        cv->fillRoundRect(cx - 10, cy + 2, 20, 6, 3, RGB565(200, 140, 190));
+        cv->fillCircle(cx, cy - 4, 3, RGB565(255, 80, 80));
+        break;
+      case FD_FISH: // fish
+        cv->fillEllipse(cx + 2, cy, 12, 7, RGB565(100, 160, 220));
+        cv->fillTriangle(cx - 10, cy, cx - 16, cy - 6, cx - 16, cy + 6, RGB565(80, 140, 200));
+        cv->fillCircle(cx + 6, cy - 2, 2, RGB565(40, 40, 80));
+        break;
+      case FD_CANDY: // candy
+        cv->fillEllipse(cx, cy, 8, 6, RGB565(220, 180, 255));
+        cv->fillTriangle(cx - 8, cy, cx - 14, cy - 4, cx - 14, cy + 4, RGB565(180, 140, 220));
+        cv->fillTriangle(cx + 8, cy, cx + 14, cy - 4, cx + 14, cy + 4, RGB565(180, 140, 220));
+        break;
+    }
+    cv->setFont(&FreeSansBold9pt7b);
+    cv->setCursor(cx - 20, cy + 28);
+    cv->setTextColor(RGB565(150, 160, 185));
+    cv->print(FD_NAME[f]);
+  }
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString("pick a snack", 120, 190, RGB565(130, 138, 158));
 }
 
 void drawEyeInt(int cx, int cy, int rx, int ry, int gx, int gy, int irisR, int pupR,
@@ -1724,8 +1957,17 @@ void drawInfo()
   } else {
     snprintf(line, sizeof(line), "USB power");
   }
-  drawCenteredString(line, 120, 200, RGB565(180, 188, 205));
-  drawCenteredString("tap to close", 120, 208, RGB565(140, 148, 165));
+  drawCenteredString(line, 120, 196, RGB565(180, 188, 205));
+
+  // accessory and favorite food
+  if (tama.accessory != ACC_NONE) {
+    snprintf(line, sizeof(line), "hat: %s", ACC_NAME[tama.accessory]);
+    drawCenteredString(line, 120, 210, ACC_COL[tama.accessory]);
+  }
+  snprintf(line, sizeof(line), "fav: %s", FD_NAME[tama.favFood]);
+  drawCenteredString(line, 120, 224, RGB565(150, 180, 200));
+
+  drawCenteredString("tap to close", 120, 238, RGB565(140, 148, 165));
 }
 
 float stagePct()
