@@ -572,7 +572,22 @@ void loop()
 {
   frameStart = micros();
   uint32_t nowMs = millis();
+
+  // debug: send 'k' over serial to instantly kill the pet
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'k' && tama.state != ST_DEAD) {
+      tama.hunger = 0;
+      tama.state = ST_DEAD;
+      diedAt = millis();
+      statsDirty = true;
+      saveTamagotchi();
+      dbg("[TAMA] killed via serial\n");
+    }
+  }
+
   handleTouchFrame();
+  nowMs = millis();    // refresh after touch handling (may reset bootAt)
 
   if (nowMs - lastTick >= 250) {
     lastTick = nowMs;
@@ -699,12 +714,13 @@ void simTick()
   for (int i = 0; i < 4; i++) anyPoop |= poopsActive(i);
 
   bool night = isNight();
-  if (tama.state != ST_SLEEPING) {
-    tama.hunger -= 0.40f * huD * dm;
-    tama.fun -= (anyPoop ? 0.56f : 0.28f) * fuD * dm;
-    tama.energy -= (tama.state == ST_PLAYING ? 0.0f : 0.15f) * enD * dm;
-  } else {
+  float sleepMul = (tama.state == ST_SLEEPING) ? 0.20f : 1.0f;
+  tama.hunger -= 0.40f * huD * dm * sleepMul;
+  tama.fun    -= (anyPoop ? 0.56f : 0.28f) * fuD * dm * sleepMul;
+  if (tama.state == ST_SLEEPING) {
     tama.energy += 0.07f * dm;
+  } else if (tama.state != ST_PLAYING) {
+    tama.energy -= 0.15f * enD * dm;
   }
   if (tama.hunger < 0) tama.hunger = 0;
   if (tama.fun < 0) tama.fun = 0;
@@ -891,13 +907,13 @@ void handleTap(uint16_t x, uint16_t y)
   if (virginBoot) return;
   if (infoOverlay) { infoOverlay = false; dbg("[UI] stats closed by tap\n"); return; }
 
-  // death: tap anywhere to re-hatch
+  // death: tap to re-hatch (with 2s cooldown so tombstone is visible)
   if (tama.state == ST_DEAD) {
+    if (diedAt && (int32_t)(millis() - diedAt) < 2000) return;  // grace period
+    diedAt = 0;
     tama = TamaData();                      // reset all stats to defaults
     tama.hatched = false;
     virginBoot = true;
-    diedAt = 0;
-    angryUntil = 0;
     bootAt = millis();                       // reset egg timer
     clearPoops();
     statsDirty = true;
@@ -947,14 +963,6 @@ void handleTap(uint16_t x, uint16_t y)
   lastTapAt = millis();
   lastTapX = x; lastTapY = y;
 
-  // top strip is always a stats shortcut
-  if (y < 45) {
-    infoOpenAt = millis();
-    infoOverlay = true;
-    dbg("[UI] stats opened (top strip)\n");
-    return;
-  }
-
   for (int i = 0; i < 3; i++) {
     if (hitIcon(i)) {
       if (i == 0) { if (!angry) startFeeding(); else headShake(); }
@@ -992,12 +1000,10 @@ void handleTouchFrame()
 {
   uint8_t ev = pollTouch();
   static uint32_t downAt = 0;
-  static bool longFired = false;
   static bool moved = false;
 
   if (ev == 1) {
     downAt = millis();
-    longFired = false;
     moved = false;
   } else if (ev == 2) {
     if (strokeAccum > 26) moved = true;
@@ -1018,20 +1024,17 @@ void handleTouchFrame()
         strokeAccum = 0;
       }
     }
-    // hold: finger stayed put (very tolerant) - ALWAYS opens (no toggle)
-    if (!longFired && millis() - downAt > 500 && maxDrift < 50 && !chooserOpen) {
-      longFired = true;
-      infoOpenAt = millis();
-      infoOverlay = true;
-      analogWrite(PIN_BL, BACKLIGHT_BRIGHT);        // never open on a dim screen
-      if (tama.state == ST_SLEEPING) { tama.state = ST_AWAKE; wakeGraceAt = millis(); }
-      for (int k = 0; k < 4; k++)
-        spawnPart(3, 120 + random(-70, 71), 116 + random(-70, 71), 0, -1, 20);
-      dbg("[UI] HOLD opened stats (drift %d)\n", maxDrift);
+    // drag over poop = clean it
+    if (tama.state == ST_AWAKE && hitPoop()) {
+      for (int i = 0; i < 4; i++)
+        if (poopsActive(i) && hitPt(tpX, tpY, POOP_SPOTS[i][0], POOP_SPOTS[i][1], 16))
+          poopSet(i, false);
+      statsDirty = true;
+      spawnPart(3, tpX, tpY, 0, -1, 20);
     }
   } else if (ev == 3) {
     if (orientPending) { orientPending = false; return; }
-    if (longFired || moved || millis() - downAt >= 500) return;
+    if (moved) return;
     // swipe gestures: left = feed, right = clean
     int ddx = (int)tpX - pressX, ddy = (int)tpY - pressY;
     if (abs(ddx) >= 55 && abs(ddy) <= 45) {
@@ -1232,17 +1235,9 @@ void renderScene(uint32_t tms)
   drawPet(tms);
   drawParticles();
   drawIcons();
-  if (!infoOverlay && !chooserOpen) drawStatsPill();   // always-visible shortcut
   if (chooserOpen) drawChooser();
   if (infoOverlay) drawInfo();
   if (game.active) drawGameOverlay(tms);
-}
-
-// tiny always-visible label that opens the stats panel (tap top strip)
-void drawStatsPill()
-{
-  cv->setFont(&FreeSansBold9pt7b);
-  drawCenteredString("STATS", 120, 12, RGB565(70, 78, 96));
 }
 
 // ---- stat ring + battery ----
@@ -1819,14 +1814,35 @@ void drawEggIntro(uint32_t tms)
 {
   uint32_t el = tms - bootAt;
   cv->fillCircle(120, 116, 96, RGB565(8, 10, 16));
-  int ex = 120 + (int)(sinf(el * 0.012f) * 6);
+
+  // egg wobbles more over time
+  float wobbleAmt = min((float)el / 60000.0f, 1.0f) * 10.0f;
+  int ex = 120 + (int)(sinf(el * 0.008f) * wobbleAmt);
+
+  // egg body
   cv->fillEllipse(ex, 118, 34, 44, RGB565(225, 228, 238));
   cv->fillEllipse(ex - 8, 104, 10, 14, RGB565(245, 246, 252));
-  if (el > 900)  cv->drawLine(ex - 14, 106, ex - 4, 114, RGB565(90, 96, 112));
-  if (el > 1500) { cv->drawLine(ex - 4, 114, ex + 6, 108, RGB565(90, 96, 112)); cv->drawLine(ex + 6, 108, ex + 2, 124, RGB565(90, 96, 112)); }
+
+  // cracks appear progressively
+  if (el > 120000) cv->drawLine(ex - 14, 106, ex - 4, 114, RGB565(90, 96, 112));
+  if (el > 180000) {
+    cv->drawLine(ex - 4, 114, ex + 6, 108, RGB565(90, 96, 112));
+    cv->drawLine(ex + 6, 108, ex + 2, 124, RGB565(90, 96, 112));
+  }
+  if (el > 240000) {
+    cv->drawLine(ex + 2, 124, ex - 10, 130, RGB565(90, 96, 112));
+    cv->drawLine(ex - 10, 130, ex + 4, 138, RGB565(90, 96, 112));
+  }
+
+  // text
   cv->setFont(&FreeSansBold9pt7b);
-  drawCenteredString(el > 1500 ? "almost..." : "something is moving", 120, 186, RGB565(130, 138, 158));
-  if (el > 2100) {
+  if (el < 180000)
+    drawCenteredString("something is moving", 120, 186, RGB565(130, 138, 158));
+  else
+    drawCenteredString("almost...", 120, 186, RGB565(130, 138, 158));
+
+  // hatch after 5 minutes
+  if (el > 300000) {
     virginBoot = false;
     tama.hatched = true;
     statsDirty = true;
