@@ -312,8 +312,8 @@ const char *FORM_NAME[4] = { "", "CHUBBY", "ATHLETIC", "SPARKLY" };
 const float FORM_SCALE[4] = { 1.0f, 1.06f, 0.94f, 1.0f };
 
 enum PetState : uint8_t { ST_AWAKE = 0, ST_EATING, ST_PLAYING, ST_SLEEPING, ST_DEAD };
-enum Stage : uint8_t { STAGE_BABY = 0, STAGE_TEEN, STAGE_ADULT };
-const char *STAGE_NAME[] = { "BABY", "TEEN", "ADULT" };
+enum Stage : uint8_t { STAGE_EGG = 0, STAGE_BABY, STAGE_TEEN, STAGE_ADULT };
+const char *STAGE_NAME[] = { "EGG", "BABY", "TEEN", "ADULT" };
 
 // food types: burger, apple, cake, fish, candy
 enum FoodType : uint8_t { FD_BURGER = 0, FD_APPLE, FD_CAKE, FD_FISH, FD_CANDY, FD_COUNT };
@@ -336,7 +336,7 @@ struct TamaData {
   uint32_t ageSec = 0;
   bool hatched = false;
   PetState state = ST_AWAKE;
-  Stage stage = STAGE_BABY;
+  Stage stage = STAGE_EGG;
   Form form = F_BALANCED;
   Personality pers = P_LAZY;
   uint16_t fedCount = 0, playCount = 0, petCount = 0;   // care history
@@ -418,10 +418,12 @@ void loadTamagotchi()
   }
   prefs.end();
   for (int i = 0; i < 4; i++) poopSet(i, (pmask & (1 << i)) != 0);
-  tama.stage = tama.ageSec < 3600UL ? STAGE_BABY
+  tama.stage = !tama.hatched ? STAGE_EGG
+             : tama.ageSec < 3600UL ? STAGE_BABY
              : tama.ageSec < 43200UL ? STAGE_TEEN : STAGE_ADULT;
-  if (wasDead && tama.hatched) {
+  if (wasDead) {
     tama.state = ST_DEAD;
+    virginBoot = false;
     dbg("[TAMA] restored dead state from NVS\n");
   }
 }
@@ -573,6 +575,7 @@ void probeBatteryPins()
 uint32_t frameStart = 0, fpsFrames = 0, fpsT0 = 0, lastTick = 0;
 float fpsShown = 0;
 uint32_t pendingMealPoop = 0;
+float ageAccum = 0;
 
 // =========================== SETUP ==========================
 void setup()
@@ -619,16 +622,79 @@ void loop()
   frameStart = micros();
   uint32_t nowMs = millis();
 
-  // debug: send 'k' over serial to instantly kill the pet
-  if (Serial.available()) {
-    char c = Serial.read();
+  // debug serial commands
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\n' || c == '\r') continue;
+    dbg("[CMD] '%c' state=%s stage=%s h=%u f=%u e=%u virgin=%d dead=%d\n",
+        c, tama.state == ST_DEAD ? "DEAD" : tama.state == ST_SLEEPING ? "SLEEP" : tama.state == ST_EATING ? "EAT" : tama.state == ST_PLAYING ? "PLAY" : "AWAKE",
+        STAGE_NAME[tama.stage], (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy, virginBoot, tama.state == ST_DEAD);
     if (c == 'k' && tama.state != ST_DEAD) {
       tama.hunger = 0;
+      tama.fun = 0;
+      tama.energy = 0;
       tama.state = ST_DEAD;
       diedAt = millis();
       statsDirty = true;
       saveTamagotchi();
-      dbg("[TAMA] killed via serial\n");
+      dbg("[CMD] killed\n");
+    }
+    if (c == 's') {
+      dbg("[CMD] age=%us h=%u%% f=%u%% e=%u%% %s/%s fed=%u play=%u pet=%u acc=%s fav=%s\n",
+          (unsigned)tama.ageSec, (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy,
+          STAGE_NAME[tama.stage], P_NAME[tama.pers], tama.fedCount, tama.playCount, tama.petCount,
+          ACC_NAME[tama.accessory], FD_NAME[tama.favFood]);
+    }
+    if (c == 'f') { tama.hunger = 100; dbg("[CMD] hunger=100\n"); }
+    if (c == 'n') { tama.fun = 100;    dbg("[CMD] fun=100\n"); }
+    if (c == 'e') { tama.energy = 100; dbg("[CMD] energy=100\n"); }
+    if (c == 'h') { tama.hunger = 0;   dbg("[CMD] hunger=0\n"); }
+    if (c == 'd') {
+      dbg("[CMD] dumping full state...\n");
+      dbg("[CMD]   h=%u%% f=%u%% e=%u%% age=%us\n", (uint8_t)tama.hunger, (uint8_t)tama.fun, (uint8_t)tama.energy, (unsigned)tama.ageSec);
+      dbg("[CMD]   state=%d stage=%d form=%d pers=%d\n", tama.state, tama.stage, tama.form, tama.pers);
+      dbg("[CMD]   fed=%u play=%u pet=%u\n", tama.fedCount, tama.playCount, tama.petCount);
+      dbg("[CMD]   virgin=%d hatched=%d\n", virginBoot, tama.hatched);
+      dbg("[CMD]   acc=%s lastF=%s fav=%s(favC=%u)\n", ACC_NAME[tama.accessory], FD_NAME[tama.lastFood], FD_NAME[tama.favFood], tama.favFoodCount);
+      dbg("[CMD]   poops=%d/%d/%d/%d\n", poopsActive(0), poopsActive(1), poopsActive(2), poopsActive(3));
+      dbg("[CMD]   free heap=%u\n", ESP.getFreeHeap());
+    }
+    if (c == 'p') { tama.state = ST_SLEEPING; analogWrite(PIN_BL, BACKLIGHT_DIM); dbg("[CMD] force sleep\n"); }
+    if (c == 'w') { tama.state = ST_AWAKE; wakeGraceAt = millis(); analogWrite(PIN_BL, BACKLIGHT_BRIGHT); dbg("[CMD] force wake\n"); }
+    if (c == 'r') {
+      dbg("[CMD] factory reset\n");
+      prefs.begin("tama", false);
+      prefs.clear();
+      prefs.end();
+      ESP.restart();
+    }
+    if (c == 'g') { for (int i = 0; i < 4; i++) poopSet(i, true); statsDirty = true; dbg("[CMD] spawn 4 poops\n"); }
+    if (c == 'm') {
+      tama.hunger = 100; tama.fun = 100; tama.energy = 100;
+      dbg("[CMD] max all stats\n");
+    }
+    if (c == 't') {
+      if (tama.state == ST_DEAD) {
+        diedAt = 0;
+        tama = TamaData();
+        tama.hatched = false;
+        virginBoot = true;
+        bootAt = millis();
+        ageAccum = 0;
+        clearPoops();
+        statsDirty = true;
+        saveTamagotchi();
+        dbg("[CMD] re-hatch triggered\n");
+      } else {
+        dbg("[CMD] not dead, can't re-hatch\n");
+      }
+    }
+    if (c == '?') {
+      dbg("[CMD] commands:\n");
+      dbg("[CMD]  k=kill      s=status    d=debug-dump\n");
+      dbg("[CMD]  f=full-hung n=full-fun  e=full-energy h=hungry\n");
+      dbg("[CMD]  p=sleep     w=wake      t=tombstone-tap(re-hatch)\n");
+      dbg("[CMD]  g=poops     m=max-all   r=factory-reset\n");
     }
   }
 
@@ -637,6 +703,7 @@ void loop()
 
   if (nowMs - lastTick >= 250) {
     lastTick = nowMs;
+    uint32_t tSim = micros();
     if (!virginBoot) simTick();
     uint32_t dSim = micros() - tSim;
     if (dSim > 50000) dbg("[PERF] simTick %lums\n", (unsigned long)(dSim / 1000));
@@ -719,8 +786,10 @@ void loop()
   if (nowMs - fpsT0 >= 1000) {
     fpsShown = fpsFrames * 1000.0f / (nowMs - fpsT0);
     fpsFrames = 0; fpsT0 = nowMs;
-    dbg("[TAMA] %s %s %.1ffps h=%u\n", STAGE_NAME[tama.stage],
-        P_NAME[tama.pers], fpsShown, ESP.getFreeHeap());
+    dbg("[TAMA] %s %s %s %.1ffps h=%u\n",
+        tama.state == ST_DEAD ? "DEAD" : STAGE_NAME[tama.stage],
+        P_NAME[tama.pers], tama.state == ST_DEAD ? "---" : "",
+        fpsShown, ESP.getFreeHeap());
   }
 
   int32_t budget = 22000 - (int32_t)(micros() - frameStart);
@@ -751,8 +820,14 @@ uint8_t calcForm()
 
 void simTick()
 {
+  if (virginBoot) return;
   float dm = 0.25f / 60.0f * TIME_SCALE;
-  tama.ageSec += (uint32_t)(0.25f * TIME_SCALE);
+  ageAccum += 0.25f * TIME_SCALE;
+  if (ageAccum >= 1.0f) {
+    uint32_t whole = (uint32_t)ageAccum;
+    tama.ageSec += whole;
+    ageAccum -= whole;
+  }
 
   // personality multipliers
   float enD = 1.0f, huD = 1.0f, fuD = 1.0f;
@@ -814,15 +889,7 @@ void simTick()
   }
   if (tama.state == ST_SLEEPING) {
     analogWrite(PIN_BL, BACKLIGHT_DIM);
-    bool wake = night ? (curHour >= NIGHT_END_HOUR && tama.energy >= 40)
-                      : (tama.energy >= 40);
-    if (wake) {
-      tama.state = ST_AWAKE;
-      wakeGraceAt = millis();
-      happyUntil = millis() + 1200;
-      analogWrite(PIN_BL, BACKLIGHT_BRIGHT);
-      dbg("[TAMA] woke up rested\n");
-    }
+    // wake only via tap (see handleTap)
   }
 
   // zoomies: full fun + full energy = the zoomies
@@ -980,6 +1047,7 @@ void handleTap(uint16_t x, uint16_t y)
     tama.hatched = false;
     virginBoot = true;
     bootAt = millis();                       // reset egg timer
+    ageAccum = 0;
     clearPoops();
     statsDirty = true;
     saveTamagotchi();
