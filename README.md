@@ -8,7 +8,8 @@ No buttons, no wires, no cloud — everything happens on the round glass.
 
 ## What it does
 
-The Orb hatches from an egg with a **personality** (lazy / hyper / picky /
+The Orb hatches from an egg after 5 minutes (progressive wobble + cracks),
+then lives on your desk with a **personality** (lazy / hyper / picky /
 cuddly — affects how fast it gets hungry/bored/tired and how much petting
 helps), then lives on your desk:
 
@@ -20,7 +21,8 @@ helps), then lives on your desk:
 | **Ball icon** (bottom-middle) | Game chooser: **pop** the bubble or **catch** falling burgers |
 | **Drop icon** (bottom-right) | Clean up all poops |
 | **Tap a poop** directly | Clean just that one |
-| **Hold finger ~1s / double-tap / tap top strip** | Stats & age panel (personality, form, time, battery) |
+| **Drag over poop** | Clean poop while petting |
+| **Hold finger ~1s / double-tap** | Stats & age panel (personality, form, time, battery) |
 | **Swipe left / right** | Quick feed / quick clean |
 
 It gets hungry/bored/tired on its own, poops after meals (and gets sadder
@@ -39,9 +41,10 @@ complains in speech bubbles when neglected. A battery % arc activates once
   with a fresh random personality. Death persists across reboots (NVS).
 - **Fun at 0 = anger.** The pet gets red eyes, a V-frown, and anger veins.
   It refuses food and games — only petting (drag) can calm it down.
-- **Energy at 0 = sleep.** The pet falls asleep and the screen dims. It
-  recovers energy over roughly one pet-day (~48 min at `TIME_SCALE=30`).
-  Tap to wake early, but it'll be groggy.
+- **Energy at 0 = sleep.** The pet falls asleep and the screen dims. While
+  sleeping, hunger and fun decay at 20% of normal speed. Energy recovers
+  over roughly one pet-day (~48 min at `TIME_SCALE=30`). Tap to wake early,
+  but it'll be groggy.
 
 ## WiFi & day/night
 
@@ -108,3 +111,9 @@ arduino-cli upload   --fqbn 'esp32:esp32:esp32c3:CDCOnBoot=cdc,FlashSize=4M' -p 
 - Rendering is integer math only (the C3 has no FPU). A 64-entry sin/cos
   lookup table replaces libm trig calls in all render-critical loops.
 - FreeSansBold fonts are bundled in `orb/Fonts/`.
+
+## Serial commands
+
+| Command | Action |
+|---|---|
+| `k` | Instantly kill the pet (debug) |
