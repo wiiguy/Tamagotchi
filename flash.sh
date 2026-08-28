@@ -14,7 +14,7 @@ mkdir -p "$BUILD"
 echo "== compile =="
 if ! arduino-cli compile --fqbn "$FQBN" --build-path "$BUILD" orb 2>&1 | tail -3; then
   echo "== COMPILE FAILED =="
-  grep -m 10 'error:' "$BUILD"/../build/compile.log 2>/dev/null
+  grep -m 10 'error:' "$BUILD/compile.log" 2>/dev/null
   exit 1
 fi
 
