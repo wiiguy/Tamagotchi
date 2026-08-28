@@ -4,7 +4,7 @@ A self-contained virtual pet for the **JCZN/Guition ESP32-2424S012** board
 (ESP32-C3 + 1.28″ round 240×240 GC9A01 IPS + CST816D touchscreen).
 No buttons, no wires, no cloud — everything happens on the round glass.
 
-![hardware](https://homeding.github.io/boards/esp32c3/jczn-esp32-2424s012.htm)
+Board reference: [JCZN ESP32-2424S012](https://homeding.github.io/boards/esp32c3/jczn-esp32-2424s012.htm)
 
 ## What it does
 
