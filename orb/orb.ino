@@ -523,7 +523,7 @@ void loop()
     if (dSim > 50000) dbg("[PERF] simTick %lums\n", (unsigned long)(dSim / 1000));
   }
 
-  if (infoOverlay && nowMs - infoOpenAt > 8000) infoOverlay = false;  // never gets stuck
+  // (stats panel closes ONLY by tapping it - no auto-close that can race)
 
   // network bookkeeping
   if (wifiConnecting && nowMs - wifiStartAt > 8000) {
@@ -564,6 +564,17 @@ void loop()
   renderScene(nowMs);
   uint32_t dRen = micros() - tRen;
   if (dRen > 50000) dbg("[PERF] render %lums\n", (unsigned long)(dRen / 1000));
+
+  // forensic: if the stats panel should be visible, verify its pixels exist
+  if (infoOverlay) {
+    static uint32_t lastDump = 0;
+    if (nowMs - lastDump > 700) {
+      lastDump = nowMs;
+      uint16_t *fb = cv->getFramebuffer();
+      dbg("[UI] fb ctr=%04X hdr=%04X bdr=%04X pill=%04X\n",
+          fb[116 * 240 + 120], fb[24 * 240 + 120], fb[2 * 240 + 2], fb[12 * 240 + 120]);
+    }
+  }
   uint32_t tFl = micros();
   cv->flush();
   uint32_t dFl = micros() - tFl;
@@ -787,7 +798,7 @@ void nextGameTarget()
 void handleTap(uint16_t x, uint16_t y)
 {
   if (virginBoot) return;
-  if (infoOverlay) { infoOverlay = false; return; }
+  if (infoOverlay) { infoOverlay = false; dbg("[UI] stats closed by tap\n"); return; }
 
   if (chooserOpen) {               // picking a game
     for (int g = 0; g < 2; g++) {
@@ -821,13 +832,19 @@ void handleTap(uint16_t x, uint16_t y)
     lastTapAt = 0;
     infoOpenAt = millis();
     infoOverlay = true;
+    dbg("[UI] stats opened (double-tap)\n");
     return;
   }
   lastTapAt = millis();
   lastTapX = x; lastTapY = y;
 
   // top strip is always a stats shortcut
-  if (y < 45) { infoOpenAt = millis(); infoOverlay = true; return; }
+  if (y < 45) {
+    infoOpenAt = millis();
+    infoOverlay = true;
+    dbg("[UI] stats opened (top strip)\n");
+    return;
+  }
 
   for (int i = 0; i < 3; i++) {
     if (hitIcon(i)) {
@@ -897,6 +914,8 @@ void handleTouchFrame()
       longFired = true;
       infoOpenAt = millis();
       infoOverlay = true;
+      analogWrite(PIN_BL, BACKLIGHT_BRIGHT);        // never open on a dim screen
+      if (tama.state == ST_SLEEPING) { tama.state = ST_AWAKE; wakeGraceAt = millis(); }
       for (int k = 0; k < 4; k++)
         spawnPart(3, 120 + random(-70, 71), 116 + random(-70, 71), 0, -1, 20);
       dbg("[UI] HOLD opened stats (drift %d)\n", maxDrift);
@@ -1093,9 +1112,17 @@ void renderScene(uint32_t tms)
   drawPet(tms);
   drawParticles();
   drawIcons();
+  if (!infoOverlay && !chooserOpen) drawStatsPill();   // always-visible shortcut
   if (chooserOpen) drawChooser();
   if (infoOverlay) drawInfo();
   if (game.active) drawGameOverlay(tms);
+}
+
+// tiny always-visible label that opens the stats panel (tap top strip)
+void drawStatsPill()
+{
+  cv->setFont(&FreeSansBold9pt7b);
+  drawCenteredString("STATS", 120, 12, RGB565(70, 78, 96));
 }
 
 // ---- stat ring + battery ----
@@ -1479,6 +1506,16 @@ void drawGameOverlay(uint32_t tms)
 // ---------------------- info overlay ------------------------
 void drawInfo()
 {
+  // full-screen white flash for the first 300ms: unmissable proof of open
+  if (millis() - infoOpenAt < 300) {
+    uint16_t *fb = cv->getFramebuffer();
+    for (uint32_t i = 0; i < 240 * 240; i++) fb[i] = RGB565(255, 255, 255);
+  }
+
+  // flashing border while open
+  if ((millis() >> 9) & 1) cv->drawRect(1, 1, 238, 238, RGB565(255, 255, 255));
+  else cv->drawRect(1, 1, 238, 238, RGB565(90, 170, 255));
+
   // bright panel - impossible to miss
   cv->fillCircle(120, 116, 98, RGB565(30, 34, 48));
   cv->drawCircle(120, 116, 98, RGB565(90, 110, 150));
