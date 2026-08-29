@@ -6,6 +6,36 @@ No buttons, no wires, no cloud — everything happens on the round glass.
 
 Board reference: [JCZN ESP32-2424S012](https://homeding.github.io/boards/esp32c3/jczn-esp32-2424s012.htm)
 
+## Screenshots
+
+*Rendered by `tools/orb_render.py` from the exact drawing calls in
+`orb.ino` (same colors, coordinates, and the bundled FreeSansBold bitmap
+fonts), so they faithfully match what the 240×240 round screen shows.*
+
+| Happy adult | Baby | Teen (curious) | Zoomies |
+|---|---|---|---|
+| ![Happy adult](screenshots/adult-happy-device.png) | ![Baby](screenshots/baby-happy-device.png) | ![Teen curious](screenshots/teen-curious-device.png) | ![Zoomies](screenshots/zoomies-device.png) |
+
+| Sleepy | Sleeping | Angry | Sad |
+|---|---|---|---|
+| ![Sleepy](screenshots/sleepy-device.png) | ![Sleeping](screenshots/sleeping-device.png) | ![Angry](screenshots/angry-device.png) | ![Sad](screenshots/sad-device.png) |
+
+| Stats panel (adult) | Stats panel (teen) | Food chooser | Game chooser |
+|---|---|---|---|
+| ![Stats adult](screenshots/stats-adult-device.png) | ![Stats teen](screenshots/stats-teen-device.png) | ![Food chooser](screenshots/food-chooser-device.png) | ![Game chooser](screenshots/game-chooser-device.png) |
+
+| Pop game | Catch game | Night clock | Egg -> hatch | R.I.P. |
+|---|---|---|---|---|
+| ![Pop game](screenshots/game-pop-device.png) | ![Catch game](screenshots/game-catch-device.png) | ![Night clock](screenshots/night-clock-device.png) | ![Egg](screenshots/egg-device.png) | ![Death](screenshots/death-device.png) |
+
+Regenerate with:
+
+```bash
+python3 tools/orb_render.py screenshots
+```
+
+Raw 240×240 frames (without the bezel) are saved alongside as `*.png`.
+
 ## What it does
 
 The Orb hatches from an egg after 5 minutes (progressive wobble + cracks),

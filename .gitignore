@@ -3,3 +3,4 @@ orb/build/
 *.log
 raise_log.txt
 raise_output.txt
+tools/__pycache__/
